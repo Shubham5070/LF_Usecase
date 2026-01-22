@@ -4,7 +4,7 @@ import re
 import json
 
 from state import GraphState
-from tools import nl_to_sql_db_tool, execute_db_query, graph_plotting_tool, cleanup_temp_table
+from tools import nl_to_sql_db_tool, graph_plotting_tool
 from llm import get_llm
 from data_availability import (
     ACTUAL_DATA_START,
@@ -145,7 +145,6 @@ def nl_to_sql_agent(state: GraphState) -> GraphState:
     print("[NL2SQL] Converting query to SQL")
 
     # Directly call the tool with the user query
-    # The tool itself handles NL to SQL conversion
     print(f"[NL2SQL] Calling DB tool with query: {state.user_query}")
     
     tool_result = nl_to_sql_db_tool.invoke(state.user_query)
@@ -158,11 +157,10 @@ def nl_to_sql_agent(state: GraphState) -> GraphState:
         )
         return state
 
-    # Store results
-    state.data_ref = tool_result["data_ref"]
-    state.data_ref["sql"] = tool_result["sql"]
-
-    print(f"[NL2SQL] Success: {state.data_ref['row_count']} rows retrieved")
+    # Store results directly (no data_ref wrapper anymore)
+    state.data_ref = tool_result  # The whole result is now the data_ref
+    
+    print(f"[NL2SQL] Success: {tool_result.get('row_count', 0)} rows retrieved")
     return state
 
 
@@ -180,7 +178,8 @@ def data_observation_agent(state: GraphState) -> GraphState:
     if state.data_ref:
         sql = state.data_ref.get("sql", "")
         row_count = state.data_ref.get("row_count", 0)
-        table_name = state.data_ref.get("name", "")
+        rows = state.data_ref.get("rows", [])
+        sample_rows = state.data_ref.get("sample_rows", [])
 
         if row_count == 0:
             state.final_answer = (
@@ -200,33 +199,35 @@ def data_observation_agent(state: GraphState) -> GraphState:
             agg_sql = generate_aggregation_query(sql, state.user_query)
             print(f"[DATA_OBSERVATION] Aggregation SQL: {agg_sql}")
             
-            # Execute aggregation
-            agg_result = execute_db_query(agg_sql)
+            # Execute aggregation using execute_aggregation_query
+            from tools import execute_aggregation_query
+            agg_result = execute_aggregation_query(agg_sql)
             
             if agg_result.get("ok"):
-                agg_rows = agg_result["data_ref"].get("rows", [])
+                agg_rows = agg_result.get("rows", [])
                 
                 state.final_answer = (
                     "✅ Data retrieved successfully.\n\n"
                     "🧾 Original Query:\n"
                     f"{sql}\n\n"
                     "📊 Dataset Summary:\n"
-                    f"- Total rows: {row_count:,}\n"
-                    f"- Source table: {table_name}\n\n"
+                    f"- Total rows: {row_count:,}\n\n"
                     "📈 Aggregated Statistics:\n"
                     f"{format_aggregation_results(agg_rows)}"
                 )
             else:
                 # Fallback to sample if aggregation fails
-                state.final_answer = format_sample_data(state.data_ref, sql)
+                state.final_answer = format_sample_data(rows, sql, row_count)
         else:
             # Small dataset - show directly
-            state.final_answer = format_sample_data(state.data_ref, sql)
+            state.final_answer = format_sample_data(rows, sql, row_count)
 
-        # Prepare graph data if needed
+        # Prepare graph data if needed (use only sample_rows for metadata)
         if state.need_graph:
             print("[DATA_OBSERVATION] Preparing graph metadata")
-            state.graph_data = prepare_graph_metadata(table_name, sql, state.user_query)
+            graph_meta = prepare_graph_metadata(sql, sample_rows, state.user_query)
+            print(f"[DATA_OBSERVATION] Graph metadata prepared: {graph_meta}")
+            state.graph_data = graph_meta
 
         return state
 
@@ -242,17 +243,20 @@ def data_observation_agent(state: GraphState) -> GraphState:
         )
         return state
 
-    state.data_ref = tool_result["data_ref"]
+    state.data_ref = tool_result
     sql = tool_result["sql"]
-    row_count = state.data_ref.get("row_count", 0)
+    row_count = tool_result.get("row_count", 0)
+    rows = tool_result.get("rows", [])
+    sample_rows = tool_result.get("sample_rows", [])
 
     # Process based on size
     if row_count > 100:
+        from tools import execute_aggregation_query
         agg_sql = generate_aggregation_query(sql, state.user_query)
-        agg_result = execute_db_query(agg_sql)
+        agg_result = execute_aggregation_query(agg_sql)
         
         if agg_result.get("ok"):
-            agg_rows = agg_result["data_ref"].get("rows", [])
+            agg_rows = agg_result.get("rows", [])
             state.final_answer = (
                 "✅ Data retrieved successfully.\n\n"
                 f"📊 Total rows: {row_count:,}\n\n"
@@ -260,13 +264,12 @@ def data_observation_agent(state: GraphState) -> GraphState:
                 f"{format_aggregation_results(agg_rows)}"
             )
         else:
-            state.final_answer = format_sample_data(state.data_ref, sql)
+            state.final_answer = format_sample_data(rows, sql, row_count)
     else:
-        state.final_answer = format_sample_data(state.data_ref, sql)
+        state.final_answer = format_sample_data(rows, sql, row_count)
 
     if state.need_graph:
-        table_name = state.data_ref.get("name", "")
-        state.graph_data = prepare_graph_metadata(table_name, sql, state.user_query)
+        state.graph_data = prepare_graph_metadata(sql, sample_rows, state.user_query)
 
     return state
 
@@ -286,48 +289,73 @@ Given an original SQL query, create an aggregation query that provides:
 - COUNT of records
 - Statistical measures (MIN, MAX, AVG) for numeric columns
 - GROUP BY date/time if temporal data exists
-- Top N records if categorical data exists
 
 Rules:
 - Output ONLY valid PostgreSQL SELECT query
+- NO explanations, NO comments, NO markdown
 - Use the same FROM clause as original
 - Add meaningful aggregations
 - Keep it concise (max 5-10 aggregation columns)
 - End with semicolon
 
-Example:
-Original: SELECT demand, date FROM lf.t_actual_demand WHERE date >= '2025-01-01'
-Aggregated: 
-SELECT 
-    COUNT(*) as total_records,
-    MIN(demand) as min_demand,
-    MAX(demand) as max_demand,
-    AVG(demand) as avg_demand,
-    DATE_TRUNC('day', date) as day,
-    COUNT(*) as records_per_day
-FROM lf.t_actual_demand 
-WHERE date >= '2025-01-01'
-GROUP BY DATE_TRUNC('day', date)
-ORDER BY day
-LIMIT 100;
+Example Input:
+SELECT datetime, date, block, demand FROM lf.t_actual_demand WHERE date >= '2025-01-01'
+
+Example Output:
+SELECT DATE_TRUNC('day', date) as day, COUNT(*) as total_records, MIN(demand) as min_demand, MAX(demand) as max_demand, AVG(demand) as avg_demand FROM lf.t_actual_demand WHERE date >= '2025-01-01' GROUP BY DATE_TRUNC('day', date) ORDER BY day LIMIT 100;
+
+CRITICAL: Output ONLY the SQL query. Nothing else.
 """
         ),
-        ("user", "Original query:\n{sql}\n\nUser question: {query}")
+        ("user", "Original query:\n{sql}")
     ])
 
     try:
-        messages = prompt.format_messages(sql=original_sql, query=user_query)
+        messages = prompt.format_messages(sql=original_sql)
         response = llm.invoke(messages).content
         
-        # Clean up response
-        agg_sql = response.replace("```sql", "").replace("```", "").strip()
+        # Clean up response - remove any markdown, explanations, etc.
+        agg_sql = response.strip()
+        
+        # Extract just the SQL if there's extra text
+        # Look for SELECT statement
+        if "SELECT" in agg_sql.upper():
+            # Find the SELECT statement
+            select_start = agg_sql.upper().find("SELECT")
+            agg_sql = agg_sql[select_start:]
+            
+            # Find the end (semicolon or end of useful SQL)
+            if ";" in agg_sql:
+                agg_sql = agg_sql[:agg_sql.find(";")+1]
+            
+            # Remove markdown
+            agg_sql = agg_sql.replace("```sql", "").replace("```", "").strip()
+            
+            # Remove any text after the query
+            lines = agg_sql.split('\n')
+            sql_lines = []
+            for line in lines:
+                # Stop at lines that look like explanations
+                if any(word in line.lower() for word in ['this query', 'note that', 'also,', 'if you want']):
+                    break
+                sql_lines.append(line)
+            
+            agg_sql = ' '.join(sql_lines)
+        
+        # Final cleanup
+        agg_sql = ' '.join(agg_sql.split())  # Normalize whitespace
+        
+        if not agg_sql.endswith(';'):
+            agg_sql += ';'
+        
+        print(f"[AGGREGATION] Cleaned SQL: {agg_sql}")
         
         return agg_sql
     except Exception as e:
         print(f"[AGGREGATION] Error generating query: {e}")
         # Fallback to simple aggregation
         return f"""
-        SELECT COUNT(*) as total_records
+        SELECT COUNT(*) as total_records, AVG(demand) as avg_demand, MIN(demand) as min_demand, MAX(demand) as max_demand
         FROM ({original_sql.replace(';', '')}) as subquery;
         """
 
@@ -353,13 +381,10 @@ def format_aggregation_results(rows: list) -> str:
     return "\n".join(result_lines)
 
 
-def format_sample_data(data_ref: dict, sql: str) -> str:
+def format_sample_data(rows: list, sql: str, row_count: int) -> str:
     """
     Formats sample data for small datasets.
     """
-    rows = data_ref.get("rows", [])
-    row_count = data_ref.get("row_count", 0)
-    
     records_text = "\n".join(str(dict(row)) for row in rows[:10])
     
     return (
@@ -373,16 +398,30 @@ def format_sample_data(data_ref: dict, sql: str) -> str:
     )
 
 
-def prepare_graph_metadata(table_name: str, sql: str, user_query: str) -> dict:
+def prepare_graph_metadata(sql: str, sample_rows: list, user_query: str) -> dict:
     """
-    Prepares metadata for graph plotting without fetching all data yet.
-    Returns column information and SQL for later data fetching.
+    Prepares metadata for graph plotting using only 3 sample rows.
+    Returns SQL query and column info for later plotting.
     """
+    
+    print(f"[GRAPH_METADATA] Preparing with {len(sample_rows)} sample rows")
+    
+    # If no sample rows, try to detect from SQL
+    if not sample_rows:
+        print("[GRAPH_METADATA] No sample rows, using defaults")
+        return {
+            "sql": sql,
+            "x_column": "datetime",
+            "y_column": "demand",
+            "plot_type": "line",
+            "title": "Actual Demand Trend"
+        }
+    
     prompt = ChatPromptTemplate.from_messages([
         (
             "system",
             """
-Analyze the SQL query and user request to determine:
+Analyze the SQL query and sample data to determine:
 1. What should be on X-axis (typically date/time)
 2. What should be on Y-axis (typically the metric being measured)
 3. What type of plot (line, bar, scatter)
@@ -393,33 +432,78 @@ Respond ONLY in JSON format with these exact fields:
 - plot_type: either "line", "bar", or "scatter"
 - title: a descriptive title for the plot
 
-Example response:
-{{"x_column": "date", "y_column": "demand", "plot_type": "line", "title": "Demand Trend"}}
+NO explanations, NO markdown, ONLY JSON.
+
+Example:
+{{"x_column": "day", "y_column": "avg_demand", "plot_type": "line", "title": "Demand Trend"}}
 """
         ),
-        ("user", "SQL: {sql}\n\nUser request: {query}")
+        ("user", "SQL: {sql}\n\nSample data columns: {columns}\n\nUser request: {query}")
     ])
     
     try:
+        # Get column names from sample data
+        columns = list(sample_rows[0].keys()) if sample_rows else []
+        
         # Format the prompt with variables
-        messages = prompt.format_messages(sql=sql, query=user_query)
+        messages = prompt.format_messages(
+            sql=sql, 
+            columns=columns,
+            query=user_query
+        )
         response = llm.invoke(messages).content
         
-        # Clean up response - remove markdown code blocks if present
+        print(f"[GRAPH_METADATA] LLM response: {response}")
+        
+        # Clean up response
         response = response.replace("```json", "").replace("```", "").strip()
         
         # Parse JSON
         metadata = json.loads(response)
-        metadata["table_name"] = table_name
-        metadata["sql"] = sql
+        metadata["sql"] = sql  # Store SQL for re-execution during plotting
+        
+        print(f"[GRAPH_METADATA] Parsed metadata: {metadata}")
         return metadata
+        
     except Exception as e:
         print(f"[GRAPH_METADATA] Parse error: {e}, using defaults")
+        
+        # Try to detect columns from sample data
+        if sample_rows:
+            columns = list(sample_rows[0].keys())
+            print(f"[GRAPH_METADATA] Available columns: {columns}")
+            
+            # Smart column detection
+            x_col = None
+            y_col = None
+            
+            # Look for time-based columns for x-axis
+            for col in columns:
+                if any(word in col.lower() for word in ['date', 'time', 'day', 'month']):
+                    x_col = col
+                    break
+            
+            # Look for numeric columns for y-axis
+            for col in columns:
+                if any(word in col.lower() for word in ['demand', 'value', 'avg', 'sum', 'count']):
+                    y_col = col
+                    break
+            
+            # Fallback to first two columns
+            if not x_col:
+                x_col = columns[0] if columns else "date"
+            if not y_col:
+                y_col = columns[1] if len(columns) > 1 else "demand"
+            
+            print(f"[GRAPH_METADATA] Detected columns: x={x_col}, y={y_col}")
+        else:
+            x_col = "datetime"
+            y_col = "demand"
+            
         return {
-            "table_name": table_name,
             "sql": sql,
-            "x_column": "datetime",
-            "y_column": "demand",
+            "x_column": x_col,
+            "y_column": y_col,
             "plot_type": "line",
             "title": "Data Visualization"
         }
@@ -470,8 +554,8 @@ def forecasting_agent(state: GraphState) -> GraphState:
         
         # Prepare graph if needed
         if state.need_graph:
-            table_name = state.data_ref.get("name", "")
-            state.graph_data = prepare_graph_metadata(table_name, sql, state.user_query)
+            sample_rows = state.data_ref.get("sample_rows", rows[:3])
+            state.graph_data = prepare_graph_metadata(sql, sample_rows, state.user_query)
         
         return state
 
@@ -521,9 +605,10 @@ Rules:
         )
         return state
 
-    state.data_ref = tool_result["data_ref"]
+    state.data_ref = tool_result
     sql = tool_result["sql"]
-    rows = state.data_ref.get("rows", [])
+    rows = tool_result.get("rows", [])
+    row_count = tool_result.get("row_count", 0)
 
     records_text = "\n".join(str(dict(row)) for row in rows[:10])
 
@@ -532,7 +617,7 @@ Rules:
         "🧾 Generated SQL:\n"
         f"{sql}\n\n"
         "📊 Summary:\n"
-        f"- Total rows: {state.data_ref['row_count']}\n\n"
+        f"- Total rows: {row_count}\n\n"
         "📄 Forecast Records:\n"
         f"{records_text}"
     )
@@ -588,9 +673,8 @@ Guidelines:
     state.final_answer = response
     return state
 
-
 # -------------------------
-# SUMMARIZATION AGENT
+# SUMMARIZATION AGENT - FIXED VERSION
 # -------------------------
 def summarization_agent(state: GraphState) -> GraphState:
     """
@@ -598,101 +682,76 @@ def summarization_agent(state: GraphState) -> GraphState:
     Maps to 'Summarization AGENT' node in flowchart.
     """
     print("[SUMMARIZATION] Generating final summary")
+    print(f"[SUMMARIZATION] need_graph={state.need_graph}, has_graph_data={state.graph_data is not None}")
 
-    # Execute graph plotting if needed
+    # Execute graph plotting if needed - FIXED TO USE SQL NOT TABLE_NAME
     if state.need_graph and state.graph_data:
-        print("[SUMMARIZATION] Executing graph plotting")
+        print("[SUMMARIZATION] ✓ Executing graph plotting")
+        print(f"[SUMMARIZATION] Graph metadata: {state.graph_data}")
         
         graph_metadata = state.graph_data
-        table_name = graph_metadata.get("table_name")
+        sql = graph_metadata.get("sql")  # CHANGED FROM table_name TO sql
         
-        if table_name:
-            # Call graph plotting tool with full data
-            plot_result = graph_plotting_tool.invoke({
-                "table_name": table_name,
-                "x_column": graph_metadata.get("x_column", "date"),
-                "y_column": graph_metadata.get("y_column", "demand"),
-                "plot_type": graph_metadata.get("plot_type", "line"),
-                "title": graph_metadata.get("title", "Data Trend"),
-                "limit": 10000  # Fetch up to 10k points for plotting
-            })
+        print(f"[SUMMARIZATION] SQL extracted: {sql is not None}")
+        
+        if sql:  # CHANGED FROM if table_name TO if sql
+            print(f"[SUMMARIZATION] Calling graph_plotting_tool with SQL: {sql[:80]}...")
             
-            if plot_result.get("ok"):
-                print(f"[SUMMARIZATION] Plot saved: {plot_result['filepath']}")
+            try:
+                plot_result = graph_plotting_tool.invoke({
+                    "sql": sql,  # CHANGED FROM table_name TO sql
+                    "x_column": graph_metadata.get("x_column", "date"),
+                    "y_column": graph_metadata.get("y_column", "demand"),
+                    "plot_type": graph_metadata.get("plot_type", "line"),
+                    "title": graph_metadata.get("title", "Data Trend"),
+                    "limit": 10000
+                })
                 
-                # Add plot info to final answer
-                plot_info = (
-                    f"\n\n📊 **Visualization Generated**\n"
-                    f"- Type: {plot_result['plot_type']}\n"
-                    f"- Data points: {plot_result['data_points']:,}\n"
-                    f"- Saved to: `{plot_result['filepath']}`\n"
-                    f"- Filename: `{plot_result['filename']}`"
-                )
+                print(f"[SUMMARIZATION] Plot result: ok={plot_result.get('ok')}")
                 
-                if state.final_answer:
-                    state.final_answer += plot_info
+                if plot_result.get("ok"):
+                    print(f"[SUMMARIZATION] ✓✓✓ PLOT SUCCESS! File: {plot_result['filepath']}")
+                    
+                    plot_info = (
+                        f"\n\n📊 **Visualization Generated**\n"
+                        f"- Type: {plot_result['plot_type']}\n"
+                        f"- Data points: {plot_result['data_points']:,}\n"
+                        f"- Saved to: `{plot_result['filepath']}`\n"
+                        f"- Filename: `{plot_result['filename']}`"
+                    )
+                    
+                    if state.final_answer:
+                        state.final_answer += plot_info
+                    else:
+                        state.final_answer = f"✅ Graph created successfully!{plot_info}"
+                    
+                    state.graph_data = plot_result
                 else:
-                    state.final_answer = f"✅ Graph created successfully!{plot_info}"
-                
-                # Store plot result in state
-                state.graph_data = plot_result
-            else:
-                error_msg = f"\n\n⚠️ Graph generation failed: {plot_result.get('error')}"
+                    print(f"[SUMMARIZATION] Plot FAILED: {plot_result.get('error')}")
+                    error_msg = f"\n\n⚠️ Graph generation failed: {plot_result.get('error')}"
+                    if state.final_answer:
+                        state.final_answer += error_msg
+                        
+            except Exception as e:
+                print(f"[SUMMARIZATION] EXCEPTION: {e}")
+                import traceback
+                traceback.print_exc()
+                error_msg = f"\n\n⚠️ Graph exception: {str(e)}"
                 if state.final_answer:
                     state.final_answer += error_msg
-                else:
-                    state.final_answer = error_msg
+        else:
+            print("[SUMMARIZATION] ERROR: No SQL in graph_data!")
+    else:
+        print(f"[SUMMARIZATION] Skipping graph - need_graph={state.need_graph}, has_data={state.graph_data is not None}")
 
-    # Clean up temporary table if exists
-    if state.data_ref and state.data_ref.get("name"):
-        table_name = state.data_ref["name"]
-        print(f"[SUMMARIZATION] Cleaning up temp table: {table_name}")
-        cleanup_temp_table(table_name)
-
-    # If it's a text-only response (no data), skip enhancement
+    # If it's a text-only response, skip enhancement
     if state.intent == "text" and state.final_answer:
         print("[SUMMARIZATION] Text response - passing through")
         return state
 
-    # If final_answer already exists, enhance it with LLM
+    # Simple pass-through, no LLM enhancement
     if state.final_answer:
-        prompt = ChatPromptTemplate.from_messages([
-            (
-                "system",
-                """
-You are a summarization agent for a load forecasting system.
-
-Your task:
-- Present information clearly and professionally
-- Highlight key insights and patterns
-- Make technical information accessible
-- Keep visualization references intact
-
-Guidelines:
-- Preserve all file paths, statistics, and technical details
-- Add context and interpretation where helpful
-- Use emojis sparingly for readability
-- Keep the tone professional but friendly
-
-IMPORTANT: Do not remove or modify:
-- File paths (e.g., plots/...)
-- Statistics (row counts, metrics)
-- SQL queries
-- Data tables
-"""
-            ),
-            ("user", "Enhance this response for clarity:\n\n{answer}")
-        ])
-
-        try:
-            enhanced = llm.invoke(
-                prompt.format_messages(answer=state.final_answer)
-            ).content
-            
-            state.final_answer = enhanced
-        except Exception as e:
-            print(f"[SUMMARIZATION] Enhancement failed: {e}, using original")
-            # Keep original answer if enhancement fails
+        print("[SUMMARIZATION] Response ready")
 
     return state
 

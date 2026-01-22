@@ -34,7 +34,59 @@ PLOTS_DIR.mkdir(exist_ok=True)
 
 
 # -------------------------
-# TOOL 1: DB (Database Tool) - POSTGRESQL FIXED
+# CORE DB EXECUTION (NO TEMP TABLES)
+# -------------------------
+
+def execute_query(sql: str, limit: int = None) -> dict:
+    """
+    Executes SQL query and returns results directly.
+    No temporary tables - just execute and fetch.
+    
+    Args:
+        sql: SQL query to execute
+        limit: Optional limit for number of rows to fetch
+        
+    Returns:
+        dict with rows, row_count, and sample_rows
+    """
+    conn = psycopg2.connect(**DB_CONFIG)
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Execute query
+            cur.execute(sql)
+            
+            # Fetch results
+            if limit:
+                rows = cur.fetchmany(limit)
+                # Get total count
+                cur.execute(f"SELECT COUNT(*) as count FROM ({sql.replace(';', '')}) as subquery")
+                row_count = cur.fetchone()['count']
+            else:
+                rows = cur.fetchall()
+                row_count = len(rows)
+            
+            # Get first 3 rows for metadata/type detection
+            sample_rows = rows[:3] if rows else []
+            
+            return {
+                "ok": True,
+                "rows": rows,
+                "row_count": row_count,
+                "sample_rows": sample_rows,
+                "sql": sql
+            }
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e),
+            "sql": sql
+        }
+    finally:
+        conn.close()
+
+
+# -------------------------
+# SQL GENERATION
 # -------------------------
 
 def generate_sql(user_prompt: str) -> str:
@@ -44,37 +96,45 @@ def generate_sql(user_prompt: str) -> str:
     payload = {
         "model": MODEL_NAME,
         "prompt": f"""
-You are a PostgreSQL expert. Generate ONLY PostgreSQL-compatible SQL queries.
+You are a PostgreSQL expert. Generate SIMPLE PostgreSQL SELECT queries ONLY.
 
-CRITICAL POSTGRESQL RULES:
-- Use PostgreSQL date functions ONLY:
-  * DATE_TRUNC('day', date) for day grouping
-  * DATE_TRUNC('month', date) for month grouping  
-  * EXTRACT(YEAR FROM date) for extracting year
-  * EXTRACT(MONTH FROM date) for extracting month
-  * date >= '2025-01-01' AND date < '2025-02-01' for date ranges
-- NEVER use STRFTIME (SQLite function - not supported in PostgreSQL)
-- NEVER use GROUP BY with STRFTIME
-- Use proper PostgreSQL column types with casts if needed
-- End SQL with semicolon
-- Output ONLY the SQL query, no explanations
+CRITICAL RULES:
+1. KEEP IT SIMPLE - No JOINs unless absolutely necessary
+2. NO window functions (OVER, PARTITION BY)
+3. NO subqueries unless required
+4. For date filtering, use: date >= 'YYYY-MM-DD' AND date < 'YYYY-MM-DD'
+5. For aggregations, use GROUP BY with DATE_TRUNC
+6. Output ONLY the SQL query, NO explanations
 
-Database Schema (PostgreSQL):
-lf.t_holidays(date DATE, name TEXT, normal_holiday BOOLEAN, special_day BOOLEAN, entrydatetime TIMESTAMP)
-lf.t_metrics(date DATE, mape FLOAT, rmse FLOAT, model_id TEXT, entrydatetime TIMESTAMP)
-lf.t_forecasted_demand(datetime TIMESTAMP, date DATE, block INT, forecasted_demand FLOAT, model_id TEXT, entrydatetime TIMESTAMP)
-lf.t_actual_demand(datetime TIMESTAMP, date DATE, block INT, demand FLOAT, entrydatetime TIMESTAMP)
+Database Tables:
+- lf.t_actual_demand(datetime TIMESTAMP, date DATE, block INT, demand FLOAT, entrydatetime TIMESTAMP)
+- lf.t_forecasted_demand(datetime TIMESTAMP, date DATE, block INT, forecasted_demand FLOAT, model_id TEXT, entrydatetime TIMESTAMP)
+- lf.t_holidays(date DATE, name TEXT, normal_holiday BOOLEAN, special_day BOOLEAN, entrydatetime TIMESTAMP)
+- lf.t_metrics(date DATE, mape FLOAT, rmse FLOAT, model_id TEXT, entrydatetime TIMESTAMP)
 
-PostgreSQL Date Function Examples:
-✓ CORRECT: SELECT * FROM lf.t_actual_demand WHERE date >= '2025-01-01' AND date < '2025-02-01'
-✓ CORRECT: SELECT DATE_TRUNC('day', date) as day, AVG(demand) FROM lf.t_actual_demand GROUP BY DATE_TRUNC('day', date)
-✓ CORRECT: SELECT EXTRACT(MONTH FROM date) as month, COUNT(*) FROM lf.t_actual_demand GROUP BY EXTRACT(MONTH FROM date)
-✗ WRONG: WHERE STRFTIME('%Y-%m', date) = '2025-01'  (This is SQLite, not PostgreSQL!)
+EXAMPLE QUERIES:
 
-User request:
-{user_prompt}
+User: "Show me actual demand for January 2025"
+SQL: SELECT datetime, date, block, demand FROM lf.t_actual_demand WHERE date >= '2025-01-01' AND date < '2025-02-01' ORDER BY datetime;
 
-PostgreSQL SQL Query:
+User: "Show me a trend of actual demand for January 2025"
+SQL: SELECT datetime, date, block, demand FROM lf.t_actual_demand WHERE date >= '2025-01-01' AND date < '2025-02-01' ORDER BY datetime;
+
+User: "Get forecast for 2025-03-15"
+SQL: SELECT datetime, date, block, forecasted_demand FROM lf.t_forecasted_demand WHERE date = '2025-03-15' ORDER BY block;
+
+User: "Show holidays in January 2025"
+SQL: SELECT date, name FROM lf.t_holidays WHERE date >= '2025-01-01' AND date < '2025-02-01' ORDER BY date;
+
+NEVER use:
+- INNER JOIN or LEFT JOIN (unless comparing actual vs forecast)
+- Window functions (OVER, PARTITION BY, ROW_NUMBER)
+- Complex subqueries
+- STRFTIME (SQLite function)
+
+User request: {user_prompt}
+
+Generate SIMPLE PostgreSQL SQL:
 """,
         "stream": False
     }
@@ -88,6 +148,27 @@ PostgreSQL SQL Query:
         print("[SQL_GEN] Warning: Detected SQLite syntax, attempting to fix...")
         sql = fix_sqlite_to_postgresql(sql)
     
+    # Check for overly complex queries
+    if "OVER" in sql.upper() or "PARTITION BY" in sql.upper():
+        print("[SQL_GEN] Warning: Detected window functions, simplifying...")
+        # Fallback to simple query based on keywords
+        if "actual" in user_prompt.lower() and "demand" in user_prompt.lower():
+            # Extract date if present
+            import re
+            date_match = re.search(r'(\d{4})-(\d{2})', user_prompt)
+            if date_match:
+                year, month = date_match.groups()
+                next_month = int(month) + 1
+                next_year = year if next_month <= 12 else str(int(year) + 1)
+                next_month = next_month if next_month <= 12 else 1
+                sql = f"SELECT datetime, date, block, demand FROM lf.t_actual_demand WHERE date >= '{year}-{month:02d}-01' AND date < '{next_year}-{next_month:02d}-01' ORDER BY datetime;"
+            elif "january" in user_prompt.lower() or "jan" in user_prompt.lower():
+                year_match = re.search(r'20\d{2}', user_prompt)
+                year = year_match.group(0) if year_match else "2025"
+                sql = f"SELECT datetime, date, block, demand FROM lf.t_actual_demand WHERE date >= '{year}-01-01' AND date < '{year}-02-01' ORDER BY datetime;"
+    
+    print(f"[SQL_GEN] Generated SQL: {sql}")
+    
     return sql
 
 
@@ -95,7 +176,6 @@ def fix_sqlite_to_postgresql(sql: str) -> str:
     """
     Attempts to convert SQLite STRFTIME to PostgreSQL equivalents.
     """
-    # Common STRFTIME patterns to PostgreSQL
     replacements = {
         r"STRFTIME\s*\(\s*['\"]%Y-%m['\"]\s*,\s*(\w+)\s*\)": r"TO_CHAR(\1, 'YYYY-MM')",
         r"STRFTIME\s*\(\s*['\"]%Y['\"]\s*,\s*(\w+)\s*\)": r"EXTRACT(YEAR FROM \1)::text",
@@ -108,7 +188,6 @@ def fix_sqlite_to_postgresql(sql: str) -> str:
     for pattern, replacement in replacements.items():
         fixed_sql = re.sub(pattern, replacement, fixed_sql, flags=re.IGNORECASE)
     
-    print(f"[SQL_FIX] Original: {sql}")
     print(f"[SQL_FIX] Fixed: {fixed_sql}")
     
     return fixed_sql
@@ -117,13 +196,10 @@ def fix_sqlite_to_postgresql(sql: str) -> str:
 def repair_schema_references(sql: str) -> str:
     """
     Force all table references to use lf. schema.
+    Only modifies table names in FROM and JOIN clauses, not column references.
     """
-    # FROM table → FROM lf.table
-    sql = re.sub(r"\bFROM\s+(?!lf\.)(\w+)", r"FROM lf.\1", sql, flags=re.IGNORECASE)
-
-    # JOIN table → JOIN lf.table
-    sql = re.sub(r"\bJOIN\s+(?!lf\.)(\w+)", r"JOIN lf.\1", sql, flags=re.IGNORECASE)
-
+    sql = re.sub(r"\bFROM\s+(?!lf\.)([a-zA-Z_][a-zA-Z0-9_]*)\b", r"FROM lf.\1", sql, flags=re.IGNORECASE)
+    sql = re.sub(r"\bJOIN\s+(?!lf\.)([a-zA-Z_][a-zA-Z0-9_]*)\b", r"JOIN lf.\1", sql, flags=re.IGNORECASE)
     return sql
 
 
@@ -141,9 +217,6 @@ def validate_sql(sql: str) -> str:
 
     if not sql.upper().startswith("SELECT"):
         raise ValueError("Only SELECT allowed")
-
-    if "limit" not in sql.lower():
-        sql += " LIMIT 10000"  # Increased limit for larger datasets
 
     return sql + ";"
 
@@ -169,63 +242,60 @@ def strip_markdown(sql: str) -> str:
     return sql.replace("```sql", "").replace("```", "").replace("`", "").strip()
 
 
-def materialize_to_temp_table(select_sql: str) -> dict:
-    """
-    Executes SQL and stores results in a temporary table.
-    """
-    table = f"tmp_query_{uuid.uuid4().hex[:8]}"
-
-    conn = psycopg2.connect(**DB_CONFIG)
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # Create temp table
-            cur.execute(f"CREATE TEMP TABLE {table} AS {select_sql}")
-
-            # Count rows
-            cur.execute(f"SELECT COUNT(*) AS count FROM {table}")
-            row_count = cur.fetchone()["count"]
-
-            # Fetch preview rows
-            cur.execute(f"SELECT * FROM {table} LIMIT 10")
-            preview_rows = cur.fetchall()
-
-            conn.commit()
-    finally:
-        conn.close()
-
-    return {
-        "type": "table",
-        "name": table,
-        "row_count": row_count,
-        "rows": preview_rows,
-    }
-
+# -------------------------
+# MAIN DB TOOL (NO TEMP TABLES)
+# -------------------------
 
 @tool
 def nl_to_sql_db_tool(user_request: str) -> dict:
     """
-    Convert natural language to SQL, execute it safely,
-    and return either data or a structured execution error.
+    Convert natural language to SQL and execute it.
+    Returns results directly - NO temp tables created.
     
-    This is the main DB tool (blue node in flowchart).
+    Returns:
+        - sql: The executed SQL query
+        - rows: First 10 rows for preview
+        - row_count: Total number of rows
+        - sample_rows: First 3 rows for metadata detection
     """
     try:
+        # Generate SQL
         sql = generate_sql(user_request)
         sql = strip_markdown(sql)
         sql = sql.replace('"', "'")
+        
+        # Validate and clean
         safe_sql = validate_sql(sql)
         safe_sql = repair_schema_references(safe_sql)
         safe_sql = normalize_invalid_dates(safe_sql)
+        
+        # Clean up any lf. in function arguments
+        safe_sql = re.sub(r'(EXTRACT\s*\([^)]*FROM\s+)lf\.', r'\1', safe_sql, flags=re.IGNORECASE)
+        safe_sql = re.sub(r'(DATE_TRUNC\s*\([^,]+,\s*)lf\.', r'\1', safe_sql, flags=re.IGNORECASE)
+        
+        print(f"[NL2SQL] Final SQL: {safe_sql}")
 
-        data_ref = materialize_to_temp_table(safe_sql)
+        # Execute and get results (limit to 10 for preview)
+        result = execute_query(safe_sql, limit=10)
+        
+        if not result.get("ok"):
+            return {
+                "ok": False,
+                "sql": safe_sql,
+                "error": result.get("error")
+            }
 
         return {
             "ok": True,
             "sql": safe_sql,
-            "data_ref": data_ref
+            "rows": result["rows"],  # First 10 rows
+            "row_count": result["row_count"],  # Total count
+            "sample_rows": result["sample_rows"],  # First 3 for metadata
         }
 
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return {
             "ok": False,
             "sql": sql if "sql" in locals() else None,
@@ -234,72 +304,30 @@ def nl_to_sql_db_tool(user_request: str) -> dict:
 
 
 # -------------------------
-# HELPER FUNCTIONS
+# HELPER: Execute Aggregation Query
 # -------------------------
 
-def execute_db_query(sql_query: str) -> dict:
+def execute_aggregation_query(original_sql: str) -> dict:
     """
-    Direct database execution without NL conversion.
-    Useful when SQL is already generated.
+    Executes an aggregation query for large datasets.
     """
     try:
-        safe_sql = validate_sql(sql_query)
-        safe_sql = repair_schema_references(safe_sql)
-        safe_sql = normalize_invalid_dates(safe_sql)
-        
-        data_ref = materialize_to_temp_table(safe_sql)
-        
-        return {
-            "ok": True,
-            "sql": safe_sql,
-            "data_ref": data_ref
-        }
-        
+        result = execute_query(original_sql)
+        return result
     except Exception as e:
         return {
             "ok": False,
-            "sql": sql_query,
             "error": str(e)
         }
 
 
-def fetch_data_from_temp_table(table_name: str, limit: int = 100) -> List[Dict]:
-    """
-    Fetches data from a temporary table created by DB tool.
-    """
-    conn = psycopg2.connect(**DB_CONFIG)
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(f"SELECT * FROM {table_name} LIMIT {limit}")
-            rows = cur.fetchall()
-            return rows
-    finally:
-        conn.close()
-
-
-def cleanup_temp_table(table_name: str) -> bool:
-    """
-    Cleans up temporary tables after use.
-    """
-    try:
-        conn = psycopg2.connect(**DB_CONFIG)
-        with conn.cursor() as cur:
-            cur.execute(f"DROP TABLE IF EXISTS {table_name}")
-            conn.commit()
-        conn.close()
-        return True
-    except Exception as e:
-        print(f"[CLEANUP] Failed to drop table {table_name}: {e}")
-        return False
-
-
 # -------------------------
-# TOOL 2: Graph Plotting
+# GRAPH PLOTTING TOOL (DIRECT DB FETCH)
 # -------------------------
 
 @tool
 def graph_plotting_tool(
-    table_name: str,
+    sql: str,  # Changed: now accepts SQL instead of table_name
     x_column: str, 
     y_column: str,
     plot_type: str = "line",
@@ -307,11 +335,10 @@ def graph_plotting_tool(
     limit: int = 10000
 ) -> dict:
     """
-    Creates visualizations from database temp table.
-    Fetches full data from temp table, creates plot, and saves to file.
+    Creates visualizations by re-executing the SQL query to fetch full data.
     
     Args:
-        table_name: Name of temp table containing data
+        sql: SQL query to fetch data for plotting
         x_column: Column name for x-axis
         y_column: Column name for y-axis
         plot_type: Type of plot (line, bar, scatter)
@@ -322,14 +349,25 @@ def graph_plotting_tool(
         Plot metadata including saved file path
     """
     try:
-        print(f"[GRAPH_PLOTTING] Creating {plot_type} plot from {table_name}")
+        print(f"[GRAPH_PLOTTING] Creating {plot_type} plot")
         
-        # Fetch full data from temp table
-        print(f"[GRAPH_PLOTTING] Fetching up to {limit} rows from {table_name}")
-        data = fetch_data_from_temp_table(table_name, limit=limit)
+        # Add limit to SQL if not already present
+        if "limit" not in sql.lower():
+            sql_with_limit = sql.replace(";", f" LIMIT {limit};")
+        else:
+            sql_with_limit = sql
+        
+        # Execute query to get all data for plotting
+        print(f"[GRAPH_PLOTTING] Fetching data from database")
+        result = execute_query(sql_with_limit)
+        
+        if not result.get("ok"):
+            raise ValueError(f"Query failed: {result.get('error')}")
+        
+        data = result["rows"]
         
         if not data:
-            raise ValueError(f"No data found in table {table_name}")
+            raise ValueError("No data returned from query")
         
         # Extract columns
         x_data = [row.get(x_column) for row in data if x_column in row]
@@ -340,7 +378,7 @@ def graph_plotting_tool(
         
         print(f"[GRAPH_PLOTTING] Plotting {len(x_data)} data points")
         
-        # Create plot with better styling
+        # Create plot
         plt.figure(figsize=(12, 6))
         plt.style.use('seaborn-v0_8-darkgrid')
         
@@ -401,7 +439,6 @@ def graph_plotting_tool(
 def cleanup_old_plots(days_to_keep: int = 7):
     """
     Removes plot files older than specified days.
-    Call this periodically to prevent disk space issues.
     """
     if not PLOTS_DIR.exists():
         return
@@ -428,57 +465,21 @@ def cleanup_old_plots(days_to_keep: int = 7):
 
 @tool
 def model_run_tool(model_type: str = "prophet", parameters: Dict[str, Any] = None) -> dict:
-    """
-    Executes machine learning model training or prediction.
-    """
-    try:
-        print(f"[MODEL_RUN] Running {model_type} model")
-        
-        result = {
-            "ok": True,
-            "model_type": model_type,
-            "status": "completed",
-            "metrics": {
-                "mape": 5.2,
-                "rmse": 120.5,
-            },
-            "predictions": [],
-            "model_id": f"model_{uuid.uuid4().hex[:8]}",
-        }
-        
-        return result
-        
-    except Exception as e:
-        return {
-            "ok": False,
-            "error": str(e),
-            "model_type": model_type,
-        }
+    """Executes machine learning model training or prediction."""
+    return {
+        "ok": True,
+        "model_type": model_type,
+        "status": "not_implemented",
+        "message": "Model execution not yet implemented"
+    }
 
 
 @tool
-def live_api_call_tool(
-    api_type: str,
-    endpoint: str = None,
-    params: Dict[str, Any] = None
-) -> dict:
-    """
-    Makes calls to external APIs for real-time data.
-    """
-    try:
-        print(f"[LIVE_API] Calling {api_type} API")
-        
-        return {
-            "ok": True,
-            "api_type": api_type,
-            "data": {
-                "message": "API integration pending - add your API logic here"
-            },
-        }
-        
-    except Exception as e:
-        return {
-            "ok": False,
-            "error": str(e),
-            "api_type": api_type,
-        }
+def live_api_call_tool(api_type: str, endpoint: str = None, params: Dict[str, Any] = None) -> dict:
+    """Makes calls to external APIs for real-time data."""
+    return {
+        "ok": True,
+        "api_type": api_type,
+        "status": "not_implemented",
+        "message": "API integration not yet implemented"
+    }
