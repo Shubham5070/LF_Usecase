@@ -1,10 +1,9 @@
+# tools.py (UPDATED with database abstraction)
 import requests
-import psycopg2
 from langchain_core.tools import tool
 import uuid
 import calendar
 import re
-from psycopg2.extras import RealDictCursor
 from typing import Dict, Any, List
 import matplotlib.pyplot as plt
 import io
@@ -12,35 +11,126 @@ import base64
 from datetime import datetime
 from pathlib import Path
 import time
+import os
+from dotenv import load_dotenv
 
+# Import database factory
+from db_factory import DatabaseFactory
+
+# Load environment variables
+load_dotenv()
 
 # -------------------------
 # CONFIGURATION
 # -------------------------
 
-OLLAMA_URL = "http://localhost:11434/api/generate"
-MODEL_NAME = "llama3.2"
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
+MODEL_NAME = os.getenv("MODEL_NAME", "llama3.2")
 
-DB_CONFIG = {
-    "host": "localhost",
-    "port": 5432,
-    "dbname": "load_forecasting",
-    "user": "postgres",
-    "password": "Test@123"
-}
+# Database configuration (now using factory)
+DB_TYPE = os.getenv("DB_TYPE", "sqlite").lower()
 
 PLOTS_DIR = Path("./plots")
 PLOTS_DIR.mkdir(exist_ok=True)
 
 
 # -------------------------
-# CORE DB EXECUTION (NO TEMP TABLES)
+# DATABASE HELPER FUNCTIONS
+# -------------------------
+
+def get_cursor_factory():
+    """Get appropriate cursor factory based on DB type"""
+    if DB_TYPE == "postgresql":
+        from psycopg2.extras import RealDictCursor
+        return RealDictCursor
+    else:  # sqlite
+        # SQLite doesn't use cursor factory, we'll handle dict conversion manually
+        return None
+
+
+def rows_to_dict(cursor, rows):
+    """Convert rows to dictionary format (works for both PostgreSQL and SQLite)"""
+    if DB_TYPE == "postgresql":
+        # PostgreSQL with RealDictCursor already returns dicts
+        return rows
+    else:  # sqlite
+        # SQLite: manually convert to dict
+        columns = [column[0] for column in cursor.description]
+        return [dict(zip(columns, row)) for row in rows]
+
+
+def adapt_sql_for_db(sql: str) -> str:
+    """
+    Adapt SQL syntax for the current database type
+    
+    PostgreSQL → SQLite conversions:
+    - lf.table_name → table_name (remove schema)
+    - TIMESTAMP → TEXT
+    - NOW() → datetime('now')
+    - DATE_TRUNC() → date() or strftime()
+    """
+    if DB_TYPE == "sqlite":
+        # Remove schema prefix (lf.)
+        sql = re.sub(r'\blf\.', '', sql)
+        
+        # Convert DATE_TRUNC to SQLite equivalent
+        # DATE_TRUNC('day', date) → date(date)
+        sql = re.sub(
+            r"DATE_TRUNC\s*\(\s*['\"]day['\"]\s*,\s*(\w+)\s*\)",
+            r"date(\1)",
+            sql,
+            flags=re.IGNORECASE
+        )
+        
+        # DATE_TRUNC('month', date) → strftime('%Y-%m', date)
+        sql = re.sub(
+            r"DATE_TRUNC\s*\(\s*['\"]month['\"]\s*,\s*(\w+)\s*\)",
+            r"strftime('%Y-%m', \1)",
+            sql,
+            flags=re.IGNORECASE
+        )
+        
+        # DATE_TRUNC('week', date) → strftime('%Y-%W', date)
+        sql = re.sub(
+            r"DATE_TRUNC\s*\(\s*['\"]week['\"]\s*,\s*(\w+)\s*\)",
+            r"strftime('%Y-%W', \1)",
+            sql,
+            flags=re.IGNORECASE
+        )
+        
+        # Convert EXTRACT to SQLite strftime
+        sql = re.sub(
+            r"EXTRACT\s*\(\s*YEAR\s+FROM\s+(\w+)\s*\)",
+            r"CAST(strftime('%Y', \1) AS INTEGER)",
+            sql,
+            flags=re.IGNORECASE
+        )
+        
+        sql = re.sub(
+            r"EXTRACT\s*\(\s*MONTH\s+FROM\s+(\w+)\s*\)",
+            r"CAST(strftime('%m', \1) AS INTEGER)",
+            sql,
+            flags=re.IGNORECASE
+        )
+        
+        sql = re.sub(
+            r"EXTRACT\s*\(\s*DAY\s+FROM\s+(\w+)\s*\)",
+            r"CAST(strftime('%d', \1) AS INTEGER)",
+            sql,
+            flags=re.IGNORECASE
+        )
+        
+    return sql
+
+
+# -------------------------
+# CORE DB EXECUTION
 # -------------------------
 
 def execute_query(sql: str, limit: int = None) -> dict:
     """
-    Executes SQL query and returns results directly.
-    No temporary tables - just execute and fetch.
+    Executes SQL query and returns results.
+    Works with both PostgreSQL and SQLite.
     
     Args:
         sql: SQL query to execute
@@ -49,32 +139,46 @@ def execute_query(sql: str, limit: int = None) -> dict:
     Returns:
         dict with rows, row_count, and sample_rows
     """
-    conn = psycopg2.connect(**DB_CONFIG)
+    # Adapt SQL for current database
+    sql = adapt_sql_for_db(sql)
+    
+    conn = DatabaseFactory.get_connection()
+    
     try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # Execute query
-            cur.execute(sql)
-            
-            # Fetch results
-            if limit:
-                rows = cur.fetchmany(limit)
-                # Get total count
-                cur.execute(f"SELECT COUNT(*) as count FROM ({sql.replace(';', '')}) as subquery")
-                row_count = cur.fetchone()['count']
-            else:
-                rows = cur.fetchall()
-                row_count = len(rows)
-            
-            # Get first 3 rows for metadata/type detection
-            sample_rows = rows[:3] if rows else []
-            
-            return {
-                "ok": True,
-                "rows": rows,
-                "row_count": row_count,
-                "sample_rows": sample_rows,
-                "sql": sql
-            }
+        if DB_TYPE == "postgresql":
+            from psycopg2.extras import RealDictCursor
+            cursor = conn.cursor(cursor_factory=RealDictCursor)
+        else:  # sqlite
+            conn.row_factory = lambda c, r: dict(zip([col[0] for col in c.description], r))
+            cursor = conn.cursor()
+        
+        # Execute query
+        cursor.execute(sql)
+        
+        # Fetch results
+        if limit:
+            rows = cursor.fetchmany(limit)
+            # Get total count
+            count_sql = f"SELECT COUNT(*) as count FROM ({sql.replace(';', '')}) as subquery"
+            cursor.execute(count_sql)
+            count_result = cursor.fetchone()
+            row_count = count_result['count'] if isinstance(count_result, dict) else count_result[0]
+        else:
+            rows = cursor.fetchall()
+            row_count = len(rows)
+        
+        # Get first 3 rows for metadata/type detection
+        sample_rows = rows[:3] if rows else []
+        
+        cursor.close()
+        
+        return {
+            "ok": True,
+            "rows": rows,
+            "row_count": row_count,
+            "sample_rows": sample_rows,
+            "sql": sql
+        }
     except Exception as e:
         return {
             "ok": False,
@@ -86,55 +190,66 @@ def execute_query(sql: str, limit: int = None) -> dict:
 
 
 # -------------------------
-# SQL GENERATION
+# SQL GENERATION (UPDATED)
 # -------------------------
 
 def generate_sql(user_prompt: str) -> str:
     """
-    Uses LLM to generate PostgreSQL-compatible SQL from natural language.
+    Uses LLM to generate SQL from natural language.
+    Automatically adapts to PostgreSQL or SQLite based on DB_TYPE.
     """
+    
+    # Choose schema based on database type
+    if DB_TYPE == "postgresql":
+        schema_prefix = "lf."
+        date_functions = """
+- For date filtering: date >= 'YYYY-MM-DD' AND date < 'YYYY-MM-DD'
+- For aggregations: DATE_TRUNC('day', date), DATE_TRUNC('month', date)
+- For extraction: EXTRACT(YEAR FROM date), EXTRACT(MONTH FROM date)
+"""
+    else:  # sqlite
+        schema_prefix = ""
+        date_functions = """
+- For date filtering: date >= 'YYYY-MM-DD' AND date < 'YYYY-MM-DD'
+- For aggregations: strftime('%Y-%m-%d', date), strftime('%Y-%m', date)
+- For extraction: CAST(strftime('%Y', date) AS INTEGER)
+"""
+    
     payload = {
         "model": MODEL_NAME,
         "prompt": f"""
-You are a PostgreSQL expert. Generate SIMPLE PostgreSQL SELECT queries ONLY.
+You are a {DB_TYPE.upper()} expert. Generate SIMPLE {DB_TYPE.upper()} SELECT queries ONLY.
 
 CRITICAL RULES:
 1. KEEP IT SIMPLE - No JOINs unless absolutely necessary
-2. NO window functions (OVER, PARTITION BY)
+2. NO window functions (OVER, PARTITION BY) {'unless necessary' if DB_TYPE == 'postgresql' else ''}
 3. NO subqueries unless required
-4. For date filtering, use: date >= 'YYYY-MM-DD' AND date < 'YYYY-MM-DD'
-5. For aggregations, use GROUP BY with DATE_TRUNC
-6. Output ONLY the SQL query, NO explanations
+{date_functions}
+5. Output ONLY the SQL query, NO explanations
 
-Database Tables:
-- lf.t_actual_demand(datetime TIMESTAMP, date DATE, block INT, demand FLOAT, entrydatetime TIMESTAMP)
-- lf.t_forecasted_demand(datetime TIMESTAMP, date DATE, block INT, forecasted_demand FLOAT, model_id TEXT, entrydatetime TIMESTAMP)
-- lf.t_holidays(date DATE, name TEXT, normal_holiday BOOLEAN, special_day BOOLEAN, entrydatetime TIMESTAMP)
-- lf.t_metrics(date DATE, mape FLOAT, rmse FLOAT, model_id TEXT, entrydatetime TIMESTAMP)
+Database Tables (schema prefix: '{schema_prefix}'):
+- {schema_prefix}t_actual_demand(datetime TEXT, date TEXT, block INTEGER, demand REAL, entrydatetime TEXT)
+- {schema_prefix}t_forecasted_demand(datetime TEXT, date TEXT, block INTEGER, forecasted_demand REAL, model_id TEXT, entrydatetime TEXT)
+- {schema_prefix}t_holidays(date TEXT, name TEXT, normal_holiday INTEGER, special_day INTEGER, entrydatetime TEXT)
+- {schema_prefix}t_metrics(date TEXT, mape REAL, rmse REAL, model_id TEXT, entrydatetime TEXT)
 
 EXAMPLE QUERIES:
 
 User: "Show me actual demand for January 2025"
-SQL: SELECT datetime, date, block, demand FROM lf.t_actual_demand WHERE date >= '2025-01-01' AND date < '2025-02-01' ORDER BY datetime;
+SQL: SELECT datetime, date, block, demand FROM {schema_prefix}t_actual_demand WHERE date >= '2025-01-01' AND date < '2025-02-01' ORDER BY datetime;
 
 User: "Show me a trend of actual demand for January 2025"
-SQL: SELECT datetime, date, block, demand FROM lf.t_actual_demand WHERE date >= '2025-01-01' AND date < '2025-02-01' ORDER BY datetime;
+SQL: SELECT datetime, date, block, demand FROM {schema_prefix}t_actual_demand WHERE date >= '2025-01-01' AND date < '2025-02-01' ORDER BY datetime;
 
 User: "Get forecast for 2025-03-15"
-SQL: SELECT datetime, date, block, forecasted_demand FROM lf.t_forecasted_demand WHERE date = '2025-03-15' ORDER BY block;
+SQL: SELECT datetime, date, block, forecasted_demand FROM {schema_prefix}t_forecasted_demand WHERE date = '2025-03-15' ORDER BY block;
 
 User: "Show holidays in January 2025"
-SQL: SELECT date, name FROM lf.t_holidays WHERE date >= '2025-01-01' AND date < '2025-02-01' ORDER BY date;
-
-NEVER use:
-- INNER JOIN or LEFT JOIN (unless comparing actual vs forecast)
-- Window functions (OVER, PARTITION BY, ROW_NUMBER)
-- Complex subqueries
-- STRFTIME (SQLite function)
+SQL: SELECT date, name FROM {schema_prefix}t_holidays WHERE date >= '2025-01-01' AND date < '2025-02-01' ORDER BY date;
 
 User request: {user_prompt}
 
-Generate SIMPLE PostgreSQL SQL:
+Generate SIMPLE {DB_TYPE.upper()} SQL:
 """,
         "stream": False
     }
@@ -143,63 +258,8 @@ Generate SIMPLE PostgreSQL SQL:
     res.raise_for_status()
     sql = res.json()["response"].strip()
     
-    # Additional validation: detect and fix STRFTIME if LLM still uses it
-    if "STRFTIME" in sql.upper() or "strftime" in sql:
-        print("[SQL_GEN] Warning: Detected SQLite syntax, attempting to fix...")
-        sql = fix_sqlite_to_postgresql(sql)
+    print(f"[SQL_GEN] Generated SQL for {DB_TYPE.upper()}: {sql}")
     
-    # Check for overly complex queries
-    if "OVER" in sql.upper() or "PARTITION BY" in sql.upper():
-        print("[SQL_GEN] Warning: Detected window functions, simplifying...")
-        # Fallback to simple query based on keywords
-        if "actual" in user_prompt.lower() and "demand" in user_prompt.lower():
-            # Extract date if present
-            import re
-            date_match = re.search(r'(\d{4})-(\d{2})', user_prompt)
-            if date_match:
-                year, month = date_match.groups()
-                next_month = int(month) + 1
-                next_year = year if next_month <= 12 else str(int(year) + 1)
-                next_month = next_month if next_month <= 12 else 1
-                sql = f"SELECT datetime, date, block, demand FROM lf.t_actual_demand WHERE date >= '{year}-{month:02d}-01' AND date < '{next_year}-{next_month:02d}-01' ORDER BY datetime;"
-            elif "january" in user_prompt.lower() or "jan" in user_prompt.lower():
-                year_match = re.search(r'20\d{2}', user_prompt)
-                year = year_match.group(0) if year_match else "2025"
-                sql = f"SELECT datetime, date, block, demand FROM lf.t_actual_demand WHERE date >= '{year}-01-01' AND date < '{year}-02-01' ORDER BY datetime;"
-    
-    print(f"[SQL_GEN] Generated SQL: {sql}")
-    
-    return sql
-
-
-def fix_sqlite_to_postgresql(sql: str) -> str:
-    """
-    Attempts to convert SQLite STRFTIME to PostgreSQL equivalents.
-    """
-    replacements = {
-        r"STRFTIME\s*\(\s*['\"]%Y-%m['\"]\s*,\s*(\w+)\s*\)": r"TO_CHAR(\1, 'YYYY-MM')",
-        r"STRFTIME\s*\(\s*['\"]%Y['\"]\s*,\s*(\w+)\s*\)": r"EXTRACT(YEAR FROM \1)::text",
-        r"STRFTIME\s*\(\s*['\"]%m['\"]\s*,\s*(\w+)\s*\)": r"EXTRACT(MONTH FROM \1)::text",
-        r"STRFTIME\s*\(\s*['\"]%W['\"]\s*,\s*(\w+)\s*\)": r"EXTRACT(WEEK FROM \1)::text",
-        r"STRFTIME\s*\(\s*['\"]%d['\"]\s*,\s*(\w+)\s*\)": r"EXTRACT(DAY FROM \1)::text",
-    }
-    
-    fixed_sql = sql
-    for pattern, replacement in replacements.items():
-        fixed_sql = re.sub(pattern, replacement, fixed_sql, flags=re.IGNORECASE)
-    
-    print(f"[SQL_FIX] Fixed: {fixed_sql}")
-    
-    return fixed_sql
-
-
-def repair_schema_references(sql: str) -> str:
-    """
-    Force all table references to use lf. schema.
-    Only modifies table names in FROM and JOIN clauses, not column references.
-    """
-    sql = re.sub(r"\bFROM\s+(?!lf\.)([a-zA-Z_][a-zA-Z0-9_]*)\b", r"FROM lf.\1", sql, flags=re.IGNORECASE)
-    sql = re.sub(r"\bJOIN\s+(?!lf\.)([a-zA-Z_][a-zA-Z0-9_]*)\b", r"JOIN lf.\1", sql, flags=re.IGNORECASE)
     return sql
 
 
@@ -243,14 +303,14 @@ def strip_markdown(sql: str) -> str:
 
 
 # -------------------------
-# MAIN DB TOOL (NO TEMP TABLES)
+# MAIN DB TOOL
 # -------------------------
 
 @tool
 def nl_to_sql_db_tool(user_request: str) -> dict:
     """
     Convert natural language to SQL and execute it.
-    Returns results directly - NO temp tables created.
+    Automatically works with PostgreSQL or SQLite based on DB_TYPE setting.
     
     Returns:
         - sql: The executed SQL query
@@ -266,14 +326,9 @@ def nl_to_sql_db_tool(user_request: str) -> dict:
         
         # Validate and clean
         safe_sql = validate_sql(sql)
-        safe_sql = repair_schema_references(safe_sql)
         safe_sql = normalize_invalid_dates(safe_sql)
         
-        # Clean up any lf. in function arguments
-        safe_sql = re.sub(r'(EXTRACT\s*\([^)]*FROM\s+)lf\.', r'\1', safe_sql, flags=re.IGNORECASE)
-        safe_sql = re.sub(r'(DATE_TRUNC\s*\([^,]+,\s*)lf\.', r'\1', safe_sql, flags=re.IGNORECASE)
-        
-        print(f"[NL2SQL] Final SQL: {safe_sql}")
+        print(f"[NL2SQL] Final SQL ({DB_TYPE.upper()}): {safe_sql}")
 
         # Execute and get results (limit to 10 for preview)
         result = execute_query(safe_sql, limit=10)
@@ -322,12 +377,12 @@ def execute_aggregation_query(original_sql: str) -> dict:
 
 
 # -------------------------
-# GRAPH PLOTTING TOOL (DIRECT DB FETCH)
+# GRAPH PLOTTING TOOL
 # -------------------------
 
 @tool
 def graph_plotting_tool(
-    sql: str,  # Changed: now accepts SQL instead of table_name
+    sql: str,
     x_column: str, 
     y_column: str,
     plot_type: str = "line",
@@ -336,6 +391,7 @@ def graph_plotting_tool(
 ) -> dict:
     """
     Creates visualizations by re-executing the SQL query to fetch full data.
+    Works with both PostgreSQL and SQLite.
     
     Args:
         sql: SQL query to fetch data for plotting
@@ -349,7 +405,10 @@ def graph_plotting_tool(
         Plot metadata including saved file path
     """
     try:
-        print(f"[GRAPH_PLOTTING] Creating {plot_type} plot")
+        print(f"[GRAPH_PLOTTING] Creating {plot_type} plot using {DB_TYPE.upper()}")
+        
+        # Adapt SQL for current database
+        sql = adapt_sql_for_db(sql)
         
         # Add limit to SQL if not already present
         if "limit" not in sql.lower():
@@ -358,7 +417,7 @@ def graph_plotting_tool(
             sql_with_limit = sql
         
         # Execute query to get all data for plotting
-        print(f"[GRAPH_PLOTTING] Fetching data from database")
+        print(f"[GRAPH_PLOTTING] Fetching data from {DB_TYPE.upper()} database")
         result = execute_query(sql_with_limit)
         
         if not result.get("ok"):

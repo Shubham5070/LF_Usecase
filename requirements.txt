@@ -1,6 +1,7 @@
 langgraph
 langchain
 langchain-core
+python-dotenv
 
 # Optional but recommended
 pydantic
@@ -17,3 +18,43 @@ fastapi
 uvicorn
 
 matplotlib
+# Core dependencies
+langchain-core>=0.1.0
+langchain-community>=0.0.20
+langgraph>=0.0.26
+pydantic>=2.5.0
+python-dotenv>=1.0.0
+
+# Database drivers
+psycopg2-binary>=2.9.9
+# sqlite3 is included with Python
+
+# HTTP and API
+requests>=2.31.0
+fastapi>=0.104.1
+uvicorn[standard]>=0.24.0
+
+# Visualization
+matplotlib>=3.8.0
+
+# LLM Providers (install only what you need)
+langchain-ollama>=0.1.0
+# langchain-openai>=0.1.0
+# langchain-anthropic>=0.1.0
+# langchain-google-genai>=1.0.0
+
+# Visualization
+matplotlib>=3.8.0
+
+# LLM Providers (install only what you need)
+# Ollama
+langchain-ollama>=0.1.0
+
+# OpenAI
+langchain-openai>=0.1.0
+
+# Anthropic
+langchain-anthropic>=0.1.0
+
+# Google Gemini
+langchain-google-genai>=1.0.0
