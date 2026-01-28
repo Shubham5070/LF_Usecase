@@ -16,6 +16,8 @@ from dotenv import load_dotenv
 
 # Import database factory
 from db_factory import DatabaseFactory
+# Import agent LLM config
+from agent_llm_config import get_agent_llm
 
 # Load environment variables
 load_dotenv()
@@ -197,7 +199,11 @@ def generate_sql(user_prompt: str) -> str:
     """
     Uses LLM to generate SQL from natural language.
     Automatically adapts to PostgreSQL or SQLite based on DB_TYPE.
+    Uses the configured LLM for nl_to_sql agent.
     """
+    
+    # Get the configured LLM for nl_to_sql agent
+    llm = get_agent_llm("nl_to_sql")
     
     # Choose schema based on database type
     if DB_TYPE == "postgresql":
@@ -215,10 +221,12 @@ def generate_sql(user_prompt: str) -> str:
 - For extraction: CAST(strftime('%Y', date) AS INTEGER)
 """
     
-    payload = {
-        "model": MODEL_NAME,
-        "prompt": f"""
-You are a {DB_TYPE.upper()} expert. Generate SIMPLE {DB_TYPE.upper()} SELECT queries ONLY.
+    from langchain_core.prompts import ChatPromptTemplate
+    
+    prompt = ChatPromptTemplate.from_messages([
+        (
+            "system",
+            f"""You are a {DB_TYPE.upper()} expert. Generate SIMPLE {DB_TYPE.upper()} SELECT queries ONLY.
 
 CRITICAL RULES:
 1. KEEP IT SIMPLE - No JOINs unless absolutely necessary
@@ -247,16 +255,15 @@ SQL: SELECT datetime, date, block, forecasted_demand FROM {schema_prefix}t_forec
 User: "Show holidays in January 2025"
 SQL: SELECT date, name FROM {schema_prefix}t_holidays WHERE date >= '2025-01-01' AND date < '2025-02-01' ORDER BY date;
 
-User request: {user_prompt}
-
-Generate SIMPLE {DB_TYPE.upper()} SQL:
-""",
-        "stream": False
-    }
-
-    res = requests.post(OLLAMA_URL, json=payload)
-    res.raise_for_status()
-    sql = res.json()["response"].strip()
+Generate SIMPLE {DB_TYPE.upper()} SQL query ONLY. No explanations."""
+        ),
+        ("user", "{user_prompt}")
+    ])
+    
+    messages = prompt.format_messages(user_prompt=user_prompt)
+    response = llm.invoke(messages).content.strip()
+    
+    sql = response
     
     print(f"[SQL_GEN] Generated SQL for {DB_TYPE.upper()}: {sql}")
     

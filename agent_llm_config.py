@@ -30,8 +30,8 @@ AGENT_LLM_CONFIG = {
     # NL to SQL Agent - complex reasoning, use more capable model
     "nl_to_sql": {
         "provider": "ollama",  # Try "openai" for better SQL generation
-        "model": "llama3.2",
-        "temperature": 0.1,
+        "model": "qwen2.5:latest",
+        "temperature": 0.0,
     },
     
     # Data Observation Agent
@@ -91,6 +91,9 @@ def get_agent_llm(agent_name: str) -> BaseChatModel:
     """
     # Check cache first
     if agent_name in _llm_cache:
+        cached_config = AGENT_LLM_CONFIG.get(agent_name, {})
+        print(f"[AGENT_LLM] Using CACHED LLM for '{agent_name}': "
+              f"{cached_config.get('provider')}/{cached_config.get('model')}")
         return _llm_cache[agent_name]
     
     # Get config for agent
@@ -102,6 +105,9 @@ def get_agent_llm(agent_name: str) -> BaseChatModel:
     
     config = AGENT_LLM_CONFIG[agent_name]
     
+    print(f"[AGENT_LLM] Creating NEW LLM for '{agent_name}': "
+          f"{config.get('provider')}/{config.get('model')} (temp={config.get('temperature')})")
+    
     # Create LLM instance
     llm = get_llm(
         provider=config.get("provider"),
@@ -112,7 +118,7 @@ def get_agent_llm(agent_name: str) -> BaseChatModel:
     # Cache it
     _llm_cache[agent_name] = llm
     
-    print(f"[AGENT_LLM] Loaded LLM for '{agent_name}': "
+    print(f"[AGENT_LLM] ✓ Loaded LLM for '{agent_name}': "
           f"{config.get('provider')}/{config.get('model')}")
     
     return llm
@@ -179,13 +185,41 @@ def get_all_agent_llm_configs() -> Dict[str, Dict[str, Any]]:
     return AGENT_LLM_CONFIG.copy()
 
 
+def clear_agent_llm_cache(agent_name: Optional[str] = None) -> None:
+    """
+    Clear LLM cache for specific agent or all agents.
+    
+    Useful when you change configuration and want fresh LLM instances.
+    
+    Args:
+        agent_name: Specific agent to clear, or None to clear all
+        
+    Example:
+        >>> clear_agent_llm_cache("nl_to_sql")  # Clear specific agent
+        >>> clear_agent_llm_cache()  # Clear all agents
+    """
+    global _llm_cache
+    
+    if agent_name is None:
+        count = len(_llm_cache)
+        _llm_cache.clear()
+        print(f"[AGENT_LLM] Cleared cache for ALL {count} agents")
+    else:
+        if agent_name in _llm_cache:
+            del _llm_cache[agent_name]
+            print(f"[AGENT_LLM] Cleared cache for '{agent_name}'")
+        else:
+            print(f"[AGENT_LLM] No cache entry for '{agent_name}'")
+
+
 def print_agent_llm_config() -> None:
     """Print current agent LLM configurations in a formatted way."""
     print("\n" + "="*70)
     print("AGENT LLM CONFIGURATION")
     print("="*70)
     for agent_name, config in AGENT_LLM_CONFIG.items():
-        print(f"\n{agent_name.upper()}")
+        cached = "✓ CACHED" if agent_name in _llm_cache else "  fresh"
+        print(f"\n{agent_name.upper():30} {cached}")
         print(f"  Provider:    {config.get('provider')}")
         print(f"  Model:       {config.get('model')}")
         print(f"  Temperature: {config.get('temperature')}")
