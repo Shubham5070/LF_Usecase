@@ -1,5 +1,5 @@
 // app.js
-const API_BASE_URL = 'http://localhost:8000/api/v1/forecast';
+const API_BASE_URL = 'http://localhost:8013/api/v1/forecast';
 
 let messageHistory = [];
 

@@ -1,6 +1,6 @@
 # state.py
 from pydantic import BaseModel
-from typing import Optional, Any
+from typing import Optional, Any, Dict
 
 
 class GraphState(BaseModel):
@@ -38,6 +38,9 @@ class GraphState(BaseModel):
     # Validation flags
     is_out_of_range: bool = False
     error_message: Optional[str] = None
+    
+    # LLM configuration (allows per-agent LLM override)
+    llm_config: Optional[Dict[str, Any]] = None  # {"provider": "openai", "model": "gpt-4", ...}
 
     class Config:
         arbitrary_types_allowed = True

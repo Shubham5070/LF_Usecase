@@ -153,14 +153,13 @@ def build_graph():
         },
     )
 
-    # All specialized agents → Summarization
+    # All specialized agents → Summarization (FIXED: using correct node names)
     graph.add_edge("data_observation", "summarization")
     graph.add_edge("forecasting", "summarization")
     graph.add_edge("decision_intelligence", "summarization")
     graph.add_edge("text", "summarization")
-
+    
     # Summarization → End
-    # Note: Graph plotting is handled within agents using graph_plotting_tool
     graph.add_edge("summarization", END)
 
     # Note: Tools (DB, Model Run, Graph Plotting, Live API) are called

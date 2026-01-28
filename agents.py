@@ -1,4 +1,3 @@
-# agents.py
 from langchain_core.prompts import ChatPromptTemplate
 from datetime import datetime, date
 import re
@@ -7,6 +6,7 @@ import json
 from state import GraphState
 from tools import nl_to_sql_db_tool, graph_plotting_tool
 from llm import get_llm
+from agent_llm_config import get_agent_llm
 from data_availability import (
     ACTUAL_DATA_START,
     ACTUAL_DATA_END,
@@ -20,12 +20,6 @@ from data_availability import (
     build_out_of_range_message,
 )
 
-
-# -------------------------
-# LLM
-# -------------------------
-llm = get_llm()
-
 # -------------------------
 # HELPERS
 # -------------------------
@@ -34,6 +28,15 @@ def extract_date_from_query(query: str) -> date | None:
     if not match:
         return None
     return date.fromisoformat(match.group(0))
+
+
+def should_show_technical_details(query: str) -> bool:
+    """Determine if user wants to see SQL/technical details"""
+    technical_keywords = [
+        "sql", "query", "show query", "show sql", "technical",
+        "debug", "how did you", "what query", "database", "show me the query"
+    ]
+    return any(keyword in query.lower() for keyword in technical_keywords)
 
 
 # -------------------------
@@ -45,6 +48,9 @@ def query_analysis_agent(state: GraphState) -> GraphState:
     Maps to 'Query analysis' node in flowchart.
     """
     print("[QUERY_ANALYSIS] Analyzing user query")
+    
+    # Get LLM configured for this agent
+    llm = get_agent_llm("query_analysis")
 
     prompt = ChatPromptTemplate.from_messages([
         (
@@ -57,20 +63,20 @@ Your task:
 - Determine required tools and agents
 
 Intent categories:
-- "data" - Historical data queries (actual demand, holidays, metrics)
-- "forecast" - Future demand predictions
-- "decision" - Business intelligence, recommendations, insights
+- "data" - Historical data queries to work or fetch data of actual demand, holidays, metrics
+- "forecast" - Future demand predictions from the database provided
+- "decision" - Business intelligence, recommendations, insights, for complex action effort queries
 - "text" - General questions, explanations, definitions
 
 Tool requirements:
-- need_db_call: true if query needs database access
+- need_db_call: true if query needs database access (for actual demand, holidays, metrics and forecast value)
 - need_graph: true ONLY if user explicitly asks for: trend, plot, graph, chart, visualize, show variation
 - need_model_run: true if user wants to train/run a new model
 - need_api_call: true if external API data is needed
 
 Rules:
 - Forecast queries ALWAYS need DB
-- Data queries about actual/historical records need DB
+- Data queries about actual/historical records need DB like for actual demand, holidays, metrics and forecasting values
 - Explanations/definitions do NOT need DB
 - "decision" intent may need DB for data-driven insights
 
@@ -126,11 +132,6 @@ def intent_identifier_agent(state: GraphState) -> GraphState:
     Maps to 'Intent Identifier (Planner)' node in flowchart.
     """
     print("[PLANNER] Planning execution path")
-    
-    # Planner validates and refines the plan
-    # Already done by query_analysis_agent, so this can be a pass-through
-    # or add additional validation logic here
-    
     print(f"[PLANNER] Execution plan: intent={state.intent}")
     return state
 
@@ -144,23 +145,21 @@ def nl_to_sql_agent(state: GraphState) -> GraphState:
     Maps to 'NL to SQL AGENT' node in flowchart.
     """
     print("[NL2SQL] Converting query to SQL")
-
-    # Directly call the tool with the user query
     print(f"[NL2SQL] Calling DB tool with query: {state.user_query}")
     
     tool_result = nl_to_sql_db_tool.invoke(state.user_query)
 
     if not tool_result.get("ok", False):
-        state.final_answer = (
-            "⚠️ SQL execution failed.\n\n"
-            f"SQL:\n{tool_result.get('sql')}\n\n"
-            f"Error:\n{tool_result.get('error')}"
-        )
+        # Store error for summarization agent to format
+        state.data_ref = {
+            "ok": False,
+            "sql": tool_result.get("sql", ""),
+            "error": tool_result.get("error", "Unknown error"),
+            "error_type": "sql_execution"
+        }
         return state
 
-    # Store results directly (no data_ref wrapper anymore)
-    state.data_ref = tool_result  # The whole result is now the data_ref
-    
+    state.data_ref = tool_result
     print(f"[NL2SQL] Success: {tool_result.get('row_count', 0)} rows retrieved")
     return state
 
@@ -175,19 +174,16 @@ def data_observation_agent(state: GraphState) -> GraphState:
     """
     print("[DATA_OBSERVATION] Processing data query")
 
-    # If we already have data from NL2SQL, format it
-    if state.data_ref:
+    # Check if we already have data from NL2SQL
+    if state.data_ref and state.data_ref.get("ok", True):
         sql = state.data_ref.get("sql", "")
         row_count = state.data_ref.get("row_count", 0)
         rows = state.data_ref.get("rows", [])
         sample_rows = state.data_ref.get("sample_rows", [])
 
         if row_count == 0:
-            state.final_answer = (
-                "🧾 Generated SQL:\n"
-                f"{sql}\n\n"
-                "📊 No records found in the database."
-            )
+            # Let summarization agent handle this
+            state.data_ref["message_type"] = "no_data"
             return state
 
         print(f"[DATA_OBSERVATION] Dataset has {row_count} rows")
@@ -196,34 +192,22 @@ def data_observation_agent(state: GraphState) -> GraphState:
         if row_count > 100:
             print("[DATA_OBSERVATION] Large dataset detected - generating aggregation")
             
-            # Generate aggregation SQL
             agg_sql = generate_aggregation_query(sql, state.user_query)
             print(f"[DATA_OBSERVATION] Aggregation SQL: {agg_sql}")
             
-            # Execute aggregation using execute_aggregation_query
             from tools import execute_aggregation_query
             agg_result = execute_aggregation_query(agg_sql)
             
             if agg_result.get("ok"):
                 agg_rows = agg_result.get("rows", [])
-                
-                state.final_answer = (
-                    "✅ Data retrieved successfully.\n\n"
-                    "🧾 Original Query:\n"
-                    f"{sql}\n\n"
-                    "📊 Dataset Summary:\n"
-                    f"- Total rows: {row_count:,}\n\n"
-                    "📈 Aggregated Statistics:\n"
-                    f"{format_aggregation_results(agg_rows)}"
-                )
+                state.data_ref["aggregation"] = agg_rows
+                state.data_ref["message_type"] = "aggregated_data"
             else:
-                # Fallback to sample if aggregation fails
-                state.final_answer = format_sample_data(rows, sql, row_count)
+                state.data_ref["message_type"] = "sample_data"
         else:
-            # Small dataset - show directly
-            state.final_answer = format_sample_data(rows, sql, row_count)
+            state.data_ref["message_type"] = "small_dataset"
 
-        # Prepare graph data if needed (use only sample_rows for metadata)
+        # Prepare graph data if needed
         if state.need_graph:
             print("[DATA_OBSERVATION] Preparing graph metadata")
             graph_meta = prepare_graph_metadata(sql, sample_rows, state.user_query)
@@ -237,11 +221,12 @@ def data_observation_agent(state: GraphState) -> GraphState:
     tool_result = nl_to_sql_db_tool.invoke(state.user_query)
 
     if not tool_result.get("ok", False):
-        state.final_answer = (
-            "⚠️ Data retrieval failed.\n\n"
-            f"SQL:\n{tool_result.get('sql')}\n\n"
-            f"Error:\n{tool_result.get('error')}"
-        )
+        state.data_ref = {
+            "ok": False,
+            "sql": tool_result.get("sql", ""),
+            "error": tool_result.get("error", ""),
+            "error_type": "data_retrieval"
+        }
         return state
 
     state.data_ref = tool_result
@@ -258,16 +243,12 @@ def data_observation_agent(state: GraphState) -> GraphState:
         
         if agg_result.get("ok"):
             agg_rows = agg_result.get("rows", [])
-            state.final_answer = (
-                "✅ Data retrieved successfully.\n\n"
-                f"📊 Total rows: {row_count:,}\n\n"
-                "📈 Statistics:\n"
-                f"{format_aggregation_results(agg_rows)}"
-            )
+            state.data_ref["aggregation"] = agg_rows
+            state.data_ref["message_type"] = "aggregated_data"
         else:
-            state.final_answer = format_sample_data(rows, sql, row_count)
+            state.data_ref["message_type"] = "sample_data"
     else:
-        state.final_answer = format_sample_data(rows, sql, row_count)
+        state.data_ref["message_type"] = "small_dataset"
 
     if state.need_graph:
         state.graph_data = prepare_graph_metadata(sql, sample_rows, state.user_query)
@@ -280,6 +261,9 @@ def generate_aggregation_query(original_sql: str, user_query: str) -> str:
     Generates an aggregation query based on the original SQL.
     Uses LLM to create meaningful aggregations.
     """
+    # Get LLM configured for data observation agent
+    llm = get_agent_llm("data_observation")
+    
     prompt = ChatPromptTemplate.from_messages([
         (
             "system",
@@ -315,88 +299,41 @@ CRITICAL: Output ONLY the SQL query. Nothing else.
         messages = prompt.format_messages(sql=original_sql)
         response = llm.invoke(messages).content
         
-        # Clean up response - remove any markdown, explanations, etc.
+        # Clean up response
         agg_sql = response.strip()
         
-        # Extract just the SQL if there's extra text
-        # Look for SELECT statement
         if "SELECT" in agg_sql.upper():
-            # Find the SELECT statement
             select_start = agg_sql.upper().find("SELECT")
             agg_sql = agg_sql[select_start:]
             
-            # Find the end (semicolon or end of useful SQL)
             if ";" in agg_sql:
                 agg_sql = agg_sql[:agg_sql.find(";")+1]
             
-            # Remove markdown
             agg_sql = agg_sql.replace("```sql", "").replace("```", "").strip()
             
-            # Remove any text after the query
             lines = agg_sql.split('\n')
             sql_lines = []
             for line in lines:
-                # Stop at lines that look like explanations
                 if any(word in line.lower() for word in ['this query', 'note that', 'also,', 'if you want']):
                     break
                 sql_lines.append(line)
             
             agg_sql = ' '.join(sql_lines)
         
-        # Final cleanup
-        agg_sql = ' '.join(agg_sql.split())  # Normalize whitespace
+        agg_sql = ' '.join(agg_sql.split())
         
         if not agg_sql.endswith(';'):
             agg_sql += ';'
         
         print(f"[AGGREGATION] Cleaned SQL: {agg_sql}")
-        
         return agg_sql
+        
     except Exception as e:
         print(f"[AGGREGATION] Error generating query: {e}")
-        # Fallback to simple aggregation
         return f"""
         SELECT COUNT(*) as total_records, AVG(demand) as avg_demand, MIN(demand) as min_demand, MAX(demand) as max_demand
         FROM ({original_sql.replace(';', '')}) as subquery;
         """
-
-
-def format_aggregation_results(rows: list) -> str:
-    """
-    Formats aggregation results in a readable way.
-    """
-    if not rows:
-        return "No aggregation data available"
-    
-    result_lines = []
-    for row in rows[:20]:  # Limit to 20 aggregated rows
-        row_dict = dict(row)
-        formatted = []
-        for key, value in row_dict.items():
-            if isinstance(value, (int, float)):
-                formatted.append(f"{key}: {value:,.2f}")
-            else:
-                formatted.append(f"{key}: {value}")
-        result_lines.append(" | ".join(formatted))
-    
-    return "\n".join(result_lines)
-
-
-def format_sample_data(rows: list, sql: str, row_count: int) -> str:
-    """
-    Formats sample data for small datasets.
-    """
-    records_text = "\n".join(str(dict(row)) for row in rows[:10])
-    
-    return (
-        "✅ Data retrieved successfully.\n\n"
-        "🧾 Generated SQL:\n"
-        f"{sql}\n\n"
-        "📊 Summary:\n"
-        f"- Total rows: {row_count}\n\n"
-        "📄 Sample Records:\n"
-        f"{records_text}"
-    )
 
 
 def prepare_graph_metadata(sql: str, sample_rows: list, user_query: str) -> dict:
@@ -404,10 +341,11 @@ def prepare_graph_metadata(sql: str, sample_rows: list, user_query: str) -> dict
     Prepares metadata for graph plotting using only 3 sample rows.
     Returns SQL query and column info for later plotting.
     """
+    # Get LLM configured for data observation agent
+    llm = get_agent_llm("data_observation")
     
     print(f"[GRAPH_METADATA] Preparing with {len(sample_rows)} sample rows")
     
-    # If no sample rows, try to detect from SQL
     if not sample_rows:
         print("[GRAPH_METADATA] No sample rows, using defaults")
         return {
@@ -443,10 +381,8 @@ Example:
     ])
     
     try:
-        # Get column names from sample data
         columns = list(sample_rows[0].keys()) if sample_rows else []
         
-        # Format the prompt with variables
         messages = prompt.format_messages(
             sql=sql, 
             columns=columns,
@@ -456,12 +392,9 @@ Example:
         
         print(f"[GRAPH_METADATA] LLM response: {response}")
         
-        # Clean up response
         response = response.replace("```json", "").replace("```", "").strip()
-        
-        # Parse JSON
         metadata = json.loads(response)
-        metadata["sql"] = sql  # Store SQL for re-execution during plotting
+        metadata["sql"] = sql
         
         print(f"[GRAPH_METADATA] Parsed metadata: {metadata}")
         return metadata
@@ -469,28 +402,23 @@ Example:
     except Exception as e:
         print(f"[GRAPH_METADATA] Parse error: {e}, using defaults")
         
-        # Try to detect columns from sample data
         if sample_rows:
             columns = list(sample_rows[0].keys())
             print(f"[GRAPH_METADATA] Available columns: {columns}")
             
-            # Smart column detection
             x_col = None
             y_col = None
             
-            # Look for time-based columns for x-axis
             for col in columns:
                 if any(word in col.lower() for word in ['date', 'time', 'day', 'month']):
                     x_col = col
                     break
             
-            # Look for numeric columns for y-axis
             for col in columns:
                 if any(word in col.lower() for word in ['demand', 'value', 'avg', 'sum', 'count']):
                     y_col = col
                     break
             
-            # Fallback to first two columns
             if not x_col:
                 x_col = columns[0] if columns else "date"
             if not y_col:
@@ -523,7 +451,11 @@ def forecasting_agent(state: GraphState) -> GraphState:
     requested_date = extract_date_from_query(state.user_query)
 
     if not requested_date:
-        state.final_answer = "Please specify a date in YYYY-MM-DD format for forecasting."
+        state.data_ref = {
+            "ok": False,
+            "error_type": "missing_date",
+            "message": "Please specify a date in YYYY-MM-DD format for forecasting."
+        }
         return state
 
     dt = datetime.combine(requested_date, datetime.min.time())
@@ -531,30 +463,37 @@ def forecasting_agent(state: GraphState) -> GraphState:
 
     # Range validation
     if not is_within_range(dt, FORECAST_DATA_START, FORECAST_DATA_END):
-        state.final_answer = build_out_of_range_message("forecast")
+        state.data_ref = {
+            "ok": False,
+            "error_type": "out_of_range",
+            "message": build_out_of_range_message("forecast"),
+            "requested_date": requested_date
+        }
         state.is_out_of_range = True
         return state
 
     # If we have data from NL2SQL, use it
-    if state.data_ref:
-        sql = state.data_ref.get("sql", "")
+    if state.data_ref and state.data_ref.get("ok", True):
         rows = state.data_ref.get("rows", [])
         row_count = state.data_ref.get("row_count", 0)
         
-        records_text = "\n".join(str(dict(row)) for row in rows[:10])
-
-        state.final_answer = (
-            "✅ Forecast retrieved successfully.\n\n"
-            "🧾 Generated SQL:\n"
-            f"{sql}\n\n"
-            "📊 Summary:\n"
-            f"- Total rows: {row_count}\n\n"
-            "📄 Forecast Records:\n"
-            f"{records_text}"
-        )
+        # Add forecast metadata
+        state.data_ref["forecast_date"] = requested_date
+        state.data_ref["message_type"] = "forecast_data"
+        
+        # Calculate statistics for summarization
+        demands = [row.get('forecasted_demand', 0) for row in rows if 'forecasted_demand' in row]
+        if demands:
+            state.data_ref["statistics"] = {
+                "avg_demand": sum(demands) / len(demands),
+                "max_demand": max(demands),
+                "min_demand": min(demands),
+                "num_blocks": len(demands)
+            }
         
         # Prepare graph if needed
         if state.need_graph:
+            sql = state.data_ref.get("sql", "")
             sample_rows = state.data_ref.get("sample_rows", rows[:3])
             state.graph_data = prepare_graph_metadata(sql, sample_rows, state.user_query)
         
@@ -581,15 +520,21 @@ Rules:
         ),
         ("user", state.user_query),
     ])
+    
+    # Get LLM configured for forecasting agent
+    llm = get_agent_llm("forecasting")
 
     llm_with_tools = llm.bind_tools([nl_to_sql_db_tool])
     response = llm_with_tools.invoke(prompt.format_messages())
 
     if not response.tool_calls:
-        state.final_answer = "Unable to generate forecast query."
+        state.data_ref = {
+            "ok": False,
+            "error_type": "query_generation",
+            "message": "Unable to generate forecast query."
+        }
         return state
 
-    # Extract tool arguments properly
     tool_args = response.tool_calls[0]["args"]
     if isinstance(tool_args, dict):
         user_request = tool_args.get("user_request", state.user_query)
@@ -599,29 +544,30 @@ Rules:
     tool_result = nl_to_sql_db_tool.invoke(user_request)
 
     if not tool_result.get("ok", False):
-        state.final_answer = (
-            "⚠️ Forecast retrieval failed.\n\n"
-            f"SQL:\n{tool_result.get('sql')}\n\n"
-            f"Error:\n{tool_result.get('error')}"
-        )
+        state.data_ref = {
+            "ok": False,
+            "sql": tool_result.get("sql", ""),
+            "error": tool_result.get("error", ""),
+            "error_type": "forecast_retrieval"
+        }
         return state
 
     state.data_ref = tool_result
-    sql = tool_result["sql"]
     rows = tool_result.get("rows", [])
-    row_count = tool_result.get("row_count", 0)
-
-    records_text = "\n".join(str(dict(row)) for row in rows[:10])
-
-    state.final_answer = (
-        "✅ Forecast retrieved successfully.\n\n"
-        "🧾 Generated SQL:\n"
-        f"{sql}\n\n"
-        "📊 Summary:\n"
-        f"- Total rows: {row_count}\n\n"
-        "📄 Forecast Records:\n"
-        f"{records_text}"
-    )
+    
+    # Add forecast metadata
+    state.data_ref["forecast_date"] = requested_date
+    state.data_ref["message_type"] = "forecast_data"
+    
+    # Calculate statistics
+    demands = [row.get('forecasted_demand', 0) for row in rows if 'forecasted_demand' in row]
+    if demands:
+        state.data_ref["statistics"] = {
+            "avg_demand": sum(demands) / len(demands),
+            "max_demand": max(demands),
+            "min_demand": min(demands),
+            "num_blocks": len(demands)
+        }
 
     return state
 
@@ -635,12 +581,21 @@ def decision_intelligence_agent(state: GraphState) -> GraphState:
     Maps to 'Decision And Intelligence AGENT' node in flowchart.
     """
     print("[DECISION] Processing decision/intelligence query")
+    
+    # Get LLM configured for this agent
+    llm = get_agent_llm("decision_intelligence")
 
     # Use data if available
     context = ""
     if state.data_ref:
         rows = state.data_ref.get("rows", [])
-        context = f"\n\nAvailable data:\n{rows}"
+        agg = state.data_ref.get("aggregation", [])
+        
+        # Provide cleaner context
+        if agg:
+            context = f"\n\nAvailable statistics:\n{agg[:5]}"
+        elif rows:
+            context = f"\n\nSample data ({len(rows)} records):\n{rows[:5]}"
 
     prompt = ChatPromptTemplate.from_messages([
         (
@@ -656,9 +611,14 @@ Your role:
 
 Guidelines:
 - Be concise and actionable
+- Use natural, conversational language
 - Focus on business value
 - Cite data when available
 - Provide clear recommendations
+- Use bullet points sparingly - prefer paragraphs
+- Don't show technical details unless asked
+
+Format your response in a friendly, professional way without excessive formatting.
 """
         ),
         ("user", "{query}{context}")
@@ -671,90 +631,383 @@ Guidelines:
         )
     ).content
 
-    state.final_answer = response
+    # Store the intelligence response for summarization
+    state.data_ref = state.data_ref or {}
+    state.data_ref["intelligence_response"] = response
+    state.data_ref["message_type"] = "decision_intelligence"
+    
     return state
 
+
 # -------------------------
-# SUMMARIZATION AGENT - FIXED VERSION
+# UNIVERSAL SUMMARIZATION AGENT
 # -------------------------
 def summarization_agent(state: GraphState) -> GraphState:
     """
-    Summarizes and presents final results.
+    Universal gateway for ALL responses to frontend.
+    Processes data from all agents and creates human-readable outputs.
     Maps to 'Summarization AGENT' node in flowchart.
     """
-    print("[SUMMARIZATION] Generating final summary")
-    print(f"[SUMMARIZATION] need_graph={state.need_graph}, has_graph_data={state.graph_data is not None}")
-
-    # Execute graph plotting if needed - FIXED TO USE SQL NOT TABLE_NAME
+    print("[SUMMARIZATION] Processing response for frontend delivery")
+    print(f"[SUMMARIZATION] Intent: {state.intent}")
+    print(f"[SUMMARIZATION] Has data_ref: {state.data_ref is not None}")
+    print(f"[SUMMARIZATION] Need graph: {state.need_graph}")
+    
+    # First, handle graph plotting if needed
     if state.need_graph and state.graph_data:
-        print("[SUMMARIZATION] ✓ Executing graph plotting")
-        print(f"[SUMMARIZATION] Graph metadata: {state.graph_data}")
-        
-        graph_metadata = state.graph_data
-        sql = graph_metadata.get("sql")  # CHANGED FROM table_name TO sql
-        
-        print(f"[SUMMARIZATION] SQL extracted: {sql is not None}")
-        
-        if sql:  # CHANGED FROM if table_name TO if sql
-            print(f"[SUMMARIZATION] Calling graph_plotting_tool with SQL: {sql[:80]}...")
-            
-            try:
-                plot_result = graph_plotting_tool.invoke({
-                    "sql": sql,  # CHANGED FROM table_name TO sql
-                    "x_column": graph_metadata.get("x_column", "date"),
-                    "y_column": graph_metadata.get("y_column", "demand"),
-                    "plot_type": graph_metadata.get("plot_type", "line"),
-                    "title": graph_metadata.get("title", "Data Trend"),
-                    "limit": 10000
-                })
-                
-                print(f"[SUMMARIZATION] Plot result: ok={plot_result.get('ok')}")
-                
-                if plot_result.get("ok"):
-                    print(f"[SUMMARIZATION] ✓✓✓ PLOT SUCCESS! File: {plot_result['filepath']}")
-                    
-                    plot_info = (
-                        f"\n\n📊 **Visualization Generated**\n"
-                        f"- Type: {plot_result['plot_type']}\n"
-                        f"- Data points: {plot_result['data_points']:,}\n"
-                        f"- Saved to: `{plot_result['filepath']}`\n"
-                        f"- Filename: `{plot_result['filename']}`"
-                    )
-                    
-                    if state.final_answer:
-                        state.final_answer += plot_info
-                    else:
-                        state.final_answer = f"✅ Graph created successfully!{plot_info}"
-                    
-                    state.graph_data = plot_result
-                else:
-                    print(f"[SUMMARIZATION] Plot FAILED: {plot_result.get('error')}")
-                    error_msg = f"\n\n⚠️ Graph generation failed: {plot_result.get('error')}"
-                    if state.final_answer:
-                        state.final_answer += error_msg
-                        
-            except Exception as e:
-                print(f"[SUMMARIZATION] EXCEPTION: {e}")
-                import traceback
-                traceback.print_exc()
-                error_msg = f"\n\n⚠️ Graph exception: {str(e)}"
-                if state.final_answer:
-                    state.final_answer += error_msg
-        else:
-            print("[SUMMARIZATION] ERROR: No SQL in graph_data!")
-    else:
-        print(f"[SUMMARIZATION] Skipping graph - need_graph={state.need_graph}, has_data={state.graph_data is not None}")
-
-    # If it's a text-only response, skip enhancement
-    if state.intent == "text" and state.final_answer:
-        print("[SUMMARIZATION] Text response - passing through")
+        state = execute_graph_plotting(state)
+    
+    # Check if there's an error to handle
+    if state.data_ref and not state.data_ref.get("ok", True):
+        state.final_answer = format_error_message(state)
         return state
-
-    # Simple pass-through, no LLM enhancement
-    if state.final_answer:
-        print("[SUMMARIZATION] Response ready")
-
+    
+    # Route to appropriate formatter based on intent and data type
+    if state.intent == "text":
+        # Text responses pass through or get formatted
+        if not state.final_answer:
+            state.final_answer = handle_text_response(state)
+    
+    elif state.intent == "data":
+        state.final_answer = format_data_response(state)
+    
+    elif state.intent == "forecast":
+        state.final_answer = format_forecast_response(state)
+    
+    elif state.intent == "decision":
+        state.final_answer = format_decision_response(state)
+    
+    else:
+        # Fallback
+        state.final_answer = state.final_answer or "I've processed your request."
+    
+    print(f"[SUMMARIZATION] Final answer ready: {len(state.final_answer)} chars")
     return state
+
+
+def execute_graph_plotting(state: GraphState) -> GraphState:
+    """Execute graph plotting and add visualization info to response"""
+    print("[SUMMARIZATION] ✓ Executing graph plotting")
+    
+    graph_metadata = state.graph_data
+    sql = graph_metadata.get("sql")
+    
+    if not sql:
+        print("[SUMMARIZATION] ERROR: No SQL in graph_data!")
+        return state
+    
+    print(f"[SUMMARIZATION] Calling graph_plotting_tool with SQL: {sql[:80]}...")
+    
+    try:
+        plot_result = graph_plotting_tool.invoke({
+            "sql": sql,
+            "x_column": graph_metadata.get("x_column", "date"),
+            "y_column": graph_metadata.get("y_column", "demand"),
+            "plot_type": graph_metadata.get("plot_type", "line"),
+            "title": graph_metadata.get("title", "Data Trend"),
+            "limit": 10000
+        })
+        
+        print(f"[SUMMARIZATION] Plot result: ok={plot_result.get('ok')}")
+        
+        if plot_result.get("ok"):
+            print(f"[SUMMARIZATION] ✓✓✓ PLOT SUCCESS! File: {plot_result['filepath']}")
+            state.graph_data = plot_result
+            state.graph_data["plot_success"] = True
+        else:
+            print(f"[SUMMARIZATION] Plot FAILED: {plot_result.get('error')}")
+            state.graph_data["plot_success"] = False
+            state.graph_data["plot_error"] = plot_result.get('error')
+            
+    except Exception as e:
+        print(f"[SUMMARIZATION] EXCEPTION: {e}")
+        import traceback
+        traceback.print_exc()
+        state.graph_data["plot_success"] = False
+        state.graph_data["plot_error"] = str(e)
+    
+    return state
+
+
+def format_error_message(state: GraphState) -> str:
+    """Format error messages in user-friendly way"""
+    data = state.data_ref
+    error_type = data.get("error_type", "unknown")
+    show_tech = should_show_technical_details(state.user_query)
+    
+    if error_type == "missing_date":
+        return data.get("message", "Please specify a date for forecasting.")
+    
+    elif error_type == "out_of_range":
+        return data.get("message", "The requested date is outside the available range.")
+    
+    elif error_type in ["sql_execution", "data_retrieval", "forecast_retrieval"]:
+        if show_tech:
+            return (
+                "⚠️ I couldn't retrieve the data.\n\n"
+                f"**SQL Query:**\n```sql\n{data.get('sql', 'N/A')}\n```\n\n"
+                f"**Error:**\n{data.get('error', 'Unknown error')}"
+            )
+        else:
+            return (
+                "⚠️ I couldn't retrieve the data from the database.\n\n"
+                "💡 *Tip: Ask me to 'show the SQL query' if you want technical details.*"
+            )
+    
+    else:
+        return "⚠️ An error occurred while processing your request."
+
+
+def handle_text_response(state: GraphState) -> str:
+    """Handle text/general query responses"""
+    if state.final_answer:
+        return state.final_answer
+    
+    # Generate a friendly response
+    return "I'm here to help with load forecasting queries. What would you like to know?"
+
+
+def format_data_response(state: GraphState) -> str:
+    """Format data query responses using LLM for natural presentation"""
+    # Get LLM configured for summarization agent
+    llm = get_agent_llm("summarization")
+    
+    data = state.data_ref or {}
+    message_type = data.get("message_type", "unknown")
+    
+    if message_type == "no_data":
+        return "I couldn't find any records matching your query in the database."
+    
+    # Prepare data summary for LLM
+    row_count = data.get("row_count", 0)
+    rows = data.get("rows", [])
+    agg = data.get("aggregation", [])
+    sql = data.get("sql", "")
+    
+    show_tech = should_show_technical_details(state.user_query)
+    
+    # Build context for LLM
+    context = {
+        "user_query": state.user_query,
+        "row_count": row_count,
+        "has_aggregation": bool(agg),
+        "aggregation_data": agg[:3] if agg else [],
+        "sample_rows": rows[:5] if rows else [],
+        "show_technical": show_tech
+    }
+    
+    prompt = ChatPromptTemplate.from_messages([
+        (
+            "system",
+            """
+You are a data presentation specialist for a load forecasting system.
+
+Your task: Convert raw database results into natural, human-readable responses.
+
+Guidelines:
+1. Write in natural, conversational language
+2. Lead with the key insights
+3. Use clear formatting (emojis are fine: 📊 📈 ⚡)
+4. For aggregated data: Highlight patterns, trends, statistics
+5. For small datasets: Present key findings, not raw tables
+6. Be concise but informative
+7. Don't show SQL queries unless show_technical is True
+8. Focus on what the user asked for
+
+Data types:
+- If has_aggregation: Focus on statistics and trends
+- If sample_rows: Present the actual data in a clean way
+- Always mention total row count if large (>10)
+
+Examples:
+User asks: "What was demand on 2025-01-15?"
+Good: "On January 15, 2025, electricity demand averaged 850.5 MW, with peak demand reaching 1,200 MW around midday."
+Bad: "I found 96 records. The SQL query returned..."
+
+User asks: "Show me demand trends for January"
+Good: "📊 January showed 2,976 demand records with average demand of 825 MW. Peak periods consistently occurred between 6-9 PM with demands exceeding 1,100 MW."
+Bad: "Here are the first 10 rows of data..."
+"""
+        ),
+        ("user", """
+User query: {user_query}
+
+Data summary:
+- Total records: {row_count}
+- Has aggregation: {has_aggregation}
+- Aggregation data: {aggregation_data}
+- Sample rows: {sample_rows}
+- Show technical details: {show_technical}
+
+Create a natural, human-readable response to the user's query.
+""")
+    ])
+    
+    try:
+        messages = prompt.format_messages(
+            user_query=state.user_query,
+            row_count=row_count,
+            has_aggregation=context["has_aggregation"],
+            aggregation_data=str(context["aggregation_data"]),
+            sample_rows=str(context["sample_rows"]),
+            show_technical=show_tech
+        )
+        
+        response = llm.invoke(messages).content
+        
+        # Add technical details if requested
+        if show_tech:
+            response += f"\n\n**Technical Details:**\n```sql\n{sql}\n```\n"
+            response += f"*Returned {row_count:,} records*"
+        
+        # Add graph info if available
+        if state.graph_data and state.graph_data.get("plot_success"):
+            plot_result = state.graph_data
+            response += (
+                f"\n\n📈 **Visualization Created**\n"
+                f"I've generated a {plot_result['plot_type']} chart with "
+                f"{plot_result.get('data_points', 0):,} data points."
+            )
+        elif state.graph_data and not state.graph_data.get("plot_success"):
+            response += f"\n\n⚠️ Note: Visualization could not be created: {state.graph_data.get('plot_error', 'Unknown error')}"
+        
+        return response
+        
+    except Exception as e:
+        print(f"[SUMMARIZATION] LLM formatting error: {e}")
+        # Fallback to basic formatting
+        return format_data_basic(data, show_tech)
+
+
+def format_data_basic(data: dict, show_tech: bool) -> str:
+    """Fallback basic data formatting"""
+    row_count = data.get("row_count", 0)
+    agg = data.get("aggregation", [])
+    rows = data.get("rows", [])
+    
+    if agg:
+        first_agg = dict(agg[0])
+        if 'avg_demand' in first_agg:
+            return (
+                f"📊 Found {row_count:,} records.\n\n"
+                f"Average demand: {first_agg.get('avg_demand', 0):.1f} MW\n"
+                f"Peak demand: {first_agg.get('max_demand', 0):.1f} MW\n"
+                f"Minimum demand: {first_agg.get('min_demand', 0):.1f} MW"
+            )
+    
+    return f"📊 Found {row_count:,} records matching your query."
+
+
+def format_forecast_response(state: GraphState) -> str:
+    """Format forecast responses using LLM"""
+    # Get LLM configured for summarization agent
+    llm = get_agent_llm("summarization")
+    
+    data = state.data_ref or {}
+    forecast_date = data.get("forecast_date")
+    statistics = data.get("statistics", {})
+    rows = data.get("rows", [])
+    
+    show_tech = should_show_technical_details(state.user_query)
+    
+    if not rows:
+        return f"No forecast data available for {forecast_date}."
+    
+    prompt = ChatPromptTemplate.from_messages([
+        (
+            "system",
+            """
+You are a forecast presentation specialist.
+
+Your task: Present demand forecast data in a clear, actionable way.
+
+Guidelines:
+1. Lead with the date and key forecast
+2. Highlight: average demand, peak demand, minimum demand
+3. Mention number of time blocks covered
+4. Use natural language, avoid jargon
+5. Be concise but informative
+6. Use emojis sparingly (🔮 for forecast, 📊 for stats)
+
+Example:
+"🔮 Forecast for January 15, 2025
+
+Expected electricity demand will average 850 MW throughout the day, with peak demand of 1,200 MW expected during evening hours. The forecast covers 96 time blocks, showing demand ranging from 600 MW in early morning to peak afternoon levels."
+"""
+        ),
+        ("user", """
+Forecast date: {forecast_date}
+Statistics:
+- Average demand: {avg_demand:.1f} MW
+- Peak demand: {max_demand:.1f} MW
+- Minimum demand: {min_demand:.1f} MW
+- Time blocks: {num_blocks}
+
+User query: {user_query}
+
+Create a natural forecast summary.
+""")
+    ])
+    
+    try:
+        messages = prompt.format_messages(
+            forecast_date=forecast_date,
+            avg_demand=statistics.get("avg_demand", 0),
+            max_demand=statistics.get("max_demand", 0),
+            min_demand=statistics.get("min_demand", 0),
+            num_blocks=statistics.get("num_blocks", 0),
+            user_query=state.user_query
+        )
+        
+        response = llm.invoke(messages).content
+        
+        # Add technical details if requested
+        if show_tech:
+            sql = data.get("sql", "")
+            response += f"\n\n**Technical Details:**\n```sql\n{sql}\n```"
+        
+        # Add graph info if available
+        if state.graph_data and state.graph_data.get("plot_success"):
+            plot_result = state.graph_data
+            response += (
+                f"\n\n📈 **Visualization Created**\n"
+                f"I've generated a {plot_result['plot_type']} chart showing the forecast trend."
+            )
+        
+        return response
+        
+    except Exception as e:
+        print(f"[SUMMARIZATION] Forecast formatting error: {e}")
+        # Fallback
+        return (
+            f"🔮 **Forecast for {forecast_date}**\n\n"
+            f"Expected electricity demand:\n"
+            f"• Average: {statistics.get('avg_demand', 0):.1f} MW\n"
+            f"• Peak: {statistics.get('max_demand', 0):.1f} MW\n"
+            f"• Minimum: {statistics.get('min_demand', 0):.1f} MW\n\n"
+            f"📊 Forecast covers {statistics.get('num_blocks', 0)} time blocks"
+        )
+
+
+def format_decision_response(state: GraphState) -> str:
+    """Format decision intelligence responses"""
+    data = state.data_ref or {}
+    intelligence_response = data.get("intelligence_response", "")
+    
+    if intelligence_response:
+        response = intelligence_response
+    else:
+        response = "I've analyzed the available data. What specific insights would you like?"
+    
+    # Add graph info if available
+    if state.graph_data and state.graph_data.get("plot_success"):
+        plot_result = state.graph_data
+        response += (
+            f"\n\n📈 **Visualization Created**\n"
+            f"I've generated a {plot_result['plot_type']} chart to support this analysis."
+        )
+    
+    return response
 
 
 # -------------------------
@@ -766,6 +1019,9 @@ def text_agent(state: GraphState) -> GraphState:
     """
     print("[TEXT] Handling general query")
     
+    # Get LLM configured for text agent
+    llm = get_agent_llm("text")
+    
     # Handle simple greetings directly
     greetings = ["hi", "hello", "hey", "good morning", "good afternoon", "good evening"]
     query_lower = state.user_query.lower().strip()
@@ -774,12 +1030,12 @@ def text_agent(state: GraphState) -> GraphState:
         state.final_answer = (
             "Hello! 👋 I'm your Load Forecasting Assistant.\n\n"
             "I can help you with:\n"
-            "• Historical demand data queries\n"
-            "• Demand forecasting predictions\n"
-            "• Holiday information\n"
-            "• Performance metrics analysis\n"
+            "• Historical demand data and trends\n"
+            "• Demand forecasting and predictions\n"
+            "• Holiday impact analysis\n"
+            "• Performance metrics\n"
             "• Business insights and recommendations\n"
-            "• Data visualizations\n\n"
+            "• Data visualizations and charts\n\n"
             "What would you like to know?"
         )
         return state
@@ -798,6 +1054,8 @@ Provide clear, accurate answers about:
 - Explanations of terms and methods
 
 Be conversational, friendly, and concise.
+Use natural language without excessive formatting.
+Avoid bullet points unless listing specific items.
 """
         ),
         ("user", "{query}")
