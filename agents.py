@@ -2,7 +2,6 @@ from langchain_core.prompts import ChatPromptTemplate
 from datetime import datetime, date
 import re
 import json
-
 from state import GraphState
 from tools import nl_to_sql_db_tool, graph_plotting_tool
 from llm import get_llm
@@ -44,7 +43,6 @@ def should_show_technical_details(query: str) -> bool:
     ]
     return any(keyword in query.lower() for keyword in technical_keywords)
 
-
 # -------------------------
 # QUERY ANALYSIS AGENT (Entry Point)
 # -------------------------
@@ -54,156 +52,57 @@ def query_analysis_agent(state: GraphState) -> GraphState:
     Maps to 'Query analysis' node in flowchart.
     """
     print("[QUERY_ANALYSIS] Analyzing user query")
-   
+    
     # Get LLM configured for this agent
     llm = get_agent_llm("query_analysis")
-   
-    from datetime import datetime
-    current_date = datetime.now().strftime("%Y-%m-%d")
-    current_date_readable = datetime.now().strftime("%B %d, %Y")
-   
+
     prompt = ChatPromptTemplate.from_messages([
         (
             "system",
             """
 You are a query analysis agent for a load forecasting system.
- 
-TODAY'S DATE: {current_date} ({current_date_readable})
- 
-DATABASE SCHEMA:
-- t_actual_demand: Actual/real historical demand
-- t_forecasted_demand: Past/future forecasted/predicted demand values (historical predictions)
-- t_holidays: Holiday information
-- t_metrics: Model performance metrics
- 
-═══════════════════════════════════════════════════════════════
-⚠️  HIGHEST PRIORITY RULE - DATE/TIME BASED ROUTING ⚠️
-═══════════════════════════════════════════════════════════════
- 
-STEP 1: IDENTIFY IF QUERY HAS A DATE/TIME REFERENCE
-- Look for: specific dates, "tomorrow", "next week", "last month", "yesterday", etc.
- 
-STEP 2: DETERMINE IF DATE IS PAST OR FUTURE
-- Compare mentioned date with TODAY ({current_date})
-- If date is BEFORE or EQUAL to {current_date} → PAST
-- If date is AFTER {current_date} → FUTURE
- 
-STEP 3: ROUTE BASED ON TIME
-- PAST date/time → intent: "data" (even if query mentions "forecast" or "predicted")
-- FUTURE date/time → intent: "forecast"
- 
-═══════════════════════════════════════════════════════════════
- 
-EXAMPLES WITH TODAY = {current_date}:
- 
-Query: "give forecasted demand of 25 june 2025"
-→ Date: 2025-06-25
-→ Comparison: 2025-06-25 is BEFORE {current_date}
-→ Result: intent: "data", need_db_call: true, need_model_run: false
- 
-Query: "give forecasted demand for tomorrow"
-→ Date: {current_date} + 1 day = FUTURE
-→ Result: intent: "forecast", need_db_call: true, need_model_run: true
- 
-Query: "what was the forecasted demand on 15 january 2025"
-→ Date: 2025-01-15
-→ Comparison: 2025-01-15 is BEFORE {current_date}
-→ Result: intent: "data", need_db_call: true, need_model_run: false
- 
-Query: "predict demand for next month"
-→ Date: February 2026 = FUTURE
-→ Result: intent: "forecast", need_db_call: true, need_model_run: true
- 
-Query: "show me actual demand for last week"
-→ Time: last week = PAST
-→ Result: intent: "data", need_db_call: true, need_model_run: false
- 
-Query: "forecast for 30 january 2026"
-→ Date: 2026-01-30
-→ Comparison: 2026-01-30 is AFTER {current_date}
-→ Result: intent: "forecast", need_db_call: true, need_model_run: true
- 
-═══════════════════════════════════════════════════════════════
- 
-INTENT CLASSIFICATION (AFTER TIME-BASED ROUTING):
- 
-1. "data" intent → ALL past/historical queries:
-   - Any query with dates BEFORE or EQUAL TO {current_date}
-   - Queries about actual demand from the past
-   - Queries about forecasted demand from the past (stored in t_forecasted_demand)
-   - Queries about holidays, metrics
-   - Time keywords: was, were, last, previous, historical, past, yesterday, [any past date]
- 
-2. "forecast" intent → ONLY future predictions:
-   - Any query with dates AFTER {current_date}
-   - Queries requesting new predictions for future dates
-   - Time keywords: will, tomorrow, next, upcoming, future, predict for [future date]
- 
-3. "decision" intent → Business intelligence (can be past or future context):
-   - Comparisons, recommendations, insights
-   - Multi-source analysis
-   - Keywords: compare, recommend, suggest, optimize, should, strategy,what-if
-   - Time-based routing still applies if specific dates mentioned
- 
-4. "text" intent → General information (no date context):
-   - Explanations, definitions, concepts
-   - No database needed
-   - Keywords: what is, explain, how does, define
- 
-═══════════════════════════════════════════════════════════════
- 
-TOOL REQUIREMENTS:
- 
-need_db_call:
-- true for "data" intent (accessing past data from all tables)
-- true for "forecast" intent (may need historical data + generating predictions)
-- true for "decision" intent (needs data for analysis)
-- true when we need to plot the graph (need_graph = true) this is hard requirement.
-- false for "text" intent
- 
-need_graph:
-- true ONLY if explicitly requested: plot, graph, chart, visualize, show trend, visual
-- false otherwise
- 
-need_model_run:
-- true ONLY for "forecast" intent (generating NEW predictions for FUTURE dates)
-- false for "data" intent (querying EXISTING past data)
-- false for "decision" intent (unless explicitly asking to run model)
- 
-need_api_call:
-- true if external data needed (weather, events for future predictions)
-- false otherwise
- 
-═══════════════════════════════════════════════════════════════
- 
-CRITICAL REMINDERS:
-1. ⚠️  DATE/TIME COMPARISON IS THE FIRST AND MOST IMPORTANT STEP
-2. ⚠️  "June 25, 2025" is BEFORE today ({current_date}), so it's PAST → "data" intent
-3. ⚠️  Even if query says "forecast" or "predict", if date is PAST → "data" intent
-4. ⚠️  Only route to "forecast" if date is genuinely in the FUTURE
- 
+
+Your task:
+- Classify the user's intent
+- Determine required tools and agents
+
+Intent categories:
+- "data" - Historical data queries to work or fetch data of actual demand, holidays, metrics
+- "forecast" - Future demand predictions from the database provided
+- "decision" - Business intelligence, recommendations, insights, for complex action effort queries
+- "text" - General questions, explanations, definitions
+
+Tool requirements:
+- need_db_call: true if query needs database access (for actual demand, holidays, metrics and forecast value)
+- need_graph: true ONLY if user explicitly asks for: trend, plot, graph, chart, visualize, show variation
+- need_model_run: true if user wants to train/run a new model
+- need_api_call: true if external API data is needed
+
+Rules:
+- Forecast queries ALWAYS need DB
+- Data queries about actual/historical records need DB like for actual demand, holidays, metrics and forecasting values
+- Explanations/definitions do NOT need DB
+- "decision" intent may need DB for data-driven insights
+
 Respond ONLY in valid JSON:
 {{
   "intent": "<data|forecast|decision|text>",
-  "need_db_call": <true|false>,
-  "need_graph": <true|false>,
-  "need_model_run": <true|false>,
-  "need_api_call": <true|false>
+  "need_db_call": true,
+  "need_graph": false,
+  "need_model_run": false,
+  "need_api_call": false
 }}
 """
         ),
         ("user", "{query}")
     ])
-   
+
     response = llm.invoke(
-        prompt.format_messages(
-            query=state.user_query,
-            current_date=current_date,
-            current_date_readable=current_date_readable
-        )
+        prompt.format_messages(query=state.user_query)
     ).content
+
     print("[QUERY_ANALYSIS] Raw response:", response)
-   
+
     # Parse JSON response
     try:
         result = json.loads(response)
@@ -212,20 +111,19 @@ Respond ONLY in valid JSON:
         state.need_graph = result.get("need_graph", False)
         state.need_model_run = result.get("need_model_run", False)
         state.need_api_call = result.get("need_api_call", False)
+
     except Exception as e:
         print("[QUERY_ANALYSIS] Parse error:", e)
         state.intent = "text"
         state.need_db_call = False
         state.need_graph = False
-        state.need_model_run = False
-        state.need_api_call = False
-   
+
     print(
         f"[QUERY_ANALYSIS] intent={state.intent}, "
         f"need_db_call={state.need_db_call}, "
-        f"need_graph={state.need_graph}, "
-        f"need_model_run={state.need_model_run}"
+        f"need_graph={state.need_graph}"
     )
+
     return state
 
 # -------------------------
