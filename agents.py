@@ -5,6 +5,7 @@ import json
 
 from state import GraphState
 from tools import nl_to_sql_db_tool, graph_plotting_tool
+from llm import get_llm
 from agent_llm_config import get_agent_llm
 from data_availability import (
     ACTUAL_DATA_START,
@@ -18,6 +19,12 @@ from data_availability import (
     is_within_range,
     build_out_of_range_message,
 )
+
+
+# -------------------------
+# LLM
+# -------------------------
+llm = get_llm()
 
 # -------------------------
 # HELPERS
@@ -47,57 +54,156 @@ def query_analysis_agent(state: GraphState) -> GraphState:
     Maps to 'Query analysis' node in flowchart.
     """
     print("[QUERY_ANALYSIS] Analyzing user query")
-    
+   
     # Get LLM configured for this agent
     llm = get_agent_llm("query_analysis")
-
+   
+    from datetime import datetime
+    current_date = datetime.now().strftime("%Y-%m-%d")
+    current_date_readable = datetime.now().strftime("%B %d, %Y")
+   
     prompt = ChatPromptTemplate.from_messages([
         (
             "system",
             """
 You are a query analysis agent for a load forecasting system.
-
-Your task:
-- Classify the user's intent
-- Determine required tools and agents
-
-Intent categories:
-- "data" - Historical data queries to work or fetch data of actual demand, holidays, metrics
-- "forecast" - Future demand predictions from the database provided
-- "decision" - Business intelligence, recommendations, insights, for complex action effort queries
-- "text" - General questions, explanations, definitions
-
-Tool requirements:
-- need_db_call: true if query needs database access (for actual demand, holidays, metrics and forecast value)
-- need_graph: true ONLY if user explicitly asks for: trend, plot, graph, chart, visualize, show variation
-- need_model_run: true if user wants to train/run a new model
-- need_api_call: true if external API data is needed
-
-Rules:
-- Forecast queries ALWAYS need DB
-- Data queries about actual/historical records need DB like for actual demand, holidays, metrics and forecasting values
-- Explanations/definitions do NOT need DB
-- "decision" intent may need DB for data-driven insights
-
+ 
+TODAY'S DATE: {current_date} ({current_date_readable})
+ 
+DATABASE SCHEMA:
+- t_actual_demand: Actual/real historical demand
+- t_forecasted_demand: Past/future forecasted/predicted demand values (historical predictions)
+- t_holidays: Holiday information
+- t_metrics: Model performance metrics
+ 
+═══════════════════════════════════════════════════════════════
+⚠️  HIGHEST PRIORITY RULE - DATE/TIME BASED ROUTING ⚠️
+═══════════════════════════════════════════════════════════════
+ 
+STEP 1: IDENTIFY IF QUERY HAS A DATE/TIME REFERENCE
+- Look for: specific dates, "tomorrow", "next week", "last month", "yesterday", etc.
+ 
+STEP 2: DETERMINE IF DATE IS PAST OR FUTURE
+- Compare mentioned date with TODAY ({current_date})
+- If date is BEFORE or EQUAL to {current_date} → PAST
+- If date is AFTER {current_date} → FUTURE
+ 
+STEP 3: ROUTE BASED ON TIME
+- PAST date/time → intent: "data" (even if query mentions "forecast" or "predicted")
+- FUTURE date/time → intent: "forecast"
+ 
+═══════════════════════════════════════════════════════════════
+ 
+EXAMPLES WITH TODAY = {current_date}:
+ 
+Query: "give forecasted demand of 25 june 2025"
+→ Date: 2025-06-25
+→ Comparison: 2025-06-25 is BEFORE {current_date}
+→ Result: intent: "data", need_db_call: true, need_model_run: false
+ 
+Query: "give forecasted demand for tomorrow"
+→ Date: {current_date} + 1 day = FUTURE
+→ Result: intent: "forecast", need_db_call: true, need_model_run: true
+ 
+Query: "what was the forecasted demand on 15 january 2025"
+→ Date: 2025-01-15
+→ Comparison: 2025-01-15 is BEFORE {current_date}
+→ Result: intent: "data", need_db_call: true, need_model_run: false
+ 
+Query: "predict demand for next month"
+→ Date: February 2026 = FUTURE
+→ Result: intent: "forecast", need_db_call: true, need_model_run: true
+ 
+Query: "show me actual demand for last week"
+→ Time: last week = PAST
+→ Result: intent: "data", need_db_call: true, need_model_run: false
+ 
+Query: "forecast for 30 january 2026"
+→ Date: 2026-01-30
+→ Comparison: 2026-01-30 is AFTER {current_date}
+→ Result: intent: "forecast", need_db_call: true, need_model_run: true
+ 
+═══════════════════════════════════════════════════════════════
+ 
+INTENT CLASSIFICATION (AFTER TIME-BASED ROUTING):
+ 
+1. "data" intent → ALL past/historical queries:
+   - Any query with dates BEFORE or EQUAL TO {current_date}
+   - Queries about actual demand from the past
+   - Queries about forecasted demand from the past (stored in t_forecasted_demand)
+   - Queries about holidays, metrics
+   - Time keywords: was, were, last, previous, historical, past, yesterday, [any past date]
+ 
+2. "forecast" intent → ONLY future predictions:
+   - Any query with dates AFTER {current_date}
+   - Queries requesting new predictions for future dates
+   - Time keywords: will, tomorrow, next, upcoming, future, predict for [future date]
+ 
+3. "decision" intent → Business intelligence (can be past or future context):
+   - Comparisons, recommendations, insights
+   - Multi-source analysis
+   - Keywords: compare, recommend, suggest, optimize, should, strategy,what-if
+   - Time-based routing still applies if specific dates mentioned
+ 
+4. "text" intent → General information (no date context):
+   - Explanations, definitions, concepts
+   - No database needed
+   - Keywords: what is, explain, how does, define
+ 
+═══════════════════════════════════════════════════════════════
+ 
+TOOL REQUIREMENTS:
+ 
+need_db_call:
+- true for "data" intent (accessing past data from all tables)
+- true for "forecast" intent (may need historical data + generating predictions)
+- true for "decision" intent (needs data for analysis)
+- true when we need to plot the graph (need_graph = true) this is hard requirement.
+- false for "text" intent
+ 
+need_graph:
+- true ONLY if explicitly requested: plot, graph, chart, visualize, show trend, visual
+- false otherwise
+ 
+need_model_run:
+- true ONLY for "forecast" intent (generating NEW predictions for FUTURE dates)
+- false for "data" intent (querying EXISTING past data)
+- false for "decision" intent (unless explicitly asking to run model)
+ 
+need_api_call:
+- true if external data needed (weather, events for future predictions)
+- false otherwise
+ 
+═══════════════════════════════════════════════════════════════
+ 
+CRITICAL REMINDERS:
+1. ⚠️  DATE/TIME COMPARISON IS THE FIRST AND MOST IMPORTANT STEP
+2. ⚠️  "June 25, 2025" is BEFORE today ({current_date}), so it's PAST → "data" intent
+3. ⚠️  Even if query says "forecast" or "predict", if date is PAST → "data" intent
+4. ⚠️  Only route to "forecast" if date is genuinely in the FUTURE
+ 
 Respond ONLY in valid JSON:
 {{
   "intent": "<data|forecast|decision|text>",
-  "need_db_call": true,
-  "need_graph": false,
-  "need_model_run": false,
-  "need_api_call": false
+  "need_db_call": <true|false>,
+  "need_graph": <true|false>,
+  "need_model_run": <true|false>,
+  "need_api_call": <true|false>
 }}
 """
         ),
         ("user", "{query}")
     ])
-
+   
     response = llm.invoke(
-        prompt.format_messages(query=state.user_query)
+        prompt.format_messages(
+            query=state.user_query,
+            current_date=current_date,
+            current_date_readable=current_date_readable
+        )
     ).content
-
     print("[QUERY_ANALYSIS] Raw response:", response)
-
+   
     # Parse JSON response
     try:
         result = json.loads(response)
@@ -106,21 +212,21 @@ Respond ONLY in valid JSON:
         state.need_graph = result.get("need_graph", False)
         state.need_model_run = result.get("need_model_run", False)
         state.need_api_call = result.get("need_api_call", False)
-
     except Exception as e:
         print("[QUERY_ANALYSIS] Parse error:", e)
         state.intent = "text"
         state.need_db_call = False
         state.need_graph = False
-
+        state.need_model_run = False
+        state.need_api_call = False
+   
     print(
         f"[QUERY_ANALYSIS] intent={state.intent}, "
         f"need_db_call={state.need_db_call}, "
-        f"need_graph={state.need_graph}"
+        f"need_graph={state.need_graph}, "
+        f"need_model_run={state.need_model_run}"
     )
-
     return state
-
 
 # -------------------------
 # INTENT IDENTIFIER (PLANNER)
@@ -260,9 +366,6 @@ def generate_aggregation_query(original_sql: str, user_query: str) -> str:
     Generates an aggregation query based on the original SQL.
     Uses LLM to create meaningful aggregations.
     """
-    # Get LLM configured for data observation agent
-    llm = get_agent_llm("data_observation")
-    
     prompt = ChatPromptTemplate.from_messages([
         (
             "system",
@@ -334,107 +437,14 @@ CRITICAL: Output ONLY the SQL query. Nothing else.
         FROM ({original_sql.replace(';', '')}) as subquery;
         """
 
-
-def prepare_graph_metadata(sql: str, sample_rows: list, user_query: str) -> dict:
+def prepare_graph_metadata(sql: str, *_args) -> dict:
     """
-    Prepares metadata for graph plotting using only 3 sample rows.
-    Returns SQL query and column info for later plotting.
+    Minimal graph metadata.
+    Visualization logic is handled dynamically by graph_plotting_tool.
     """
-    # Get LLM configured for data observation agent
-    llm = get_agent_llm("data_observation")
-    
-    print(f"[GRAPH_METADATA] Preparing with {len(sample_rows)} sample rows")
-    
-    if not sample_rows:
-        print("[GRAPH_METADATA] No sample rows, using defaults")
-        return {
-            "sql": sql,
-            "x_column": "datetime",
-            "y_column": "demand",
-            "plot_type": "line",
-            "title": "Actual Demand Trend"
-        }
-    
-    prompt = ChatPromptTemplate.from_messages([
-        (
-            "system",
-            """
-Analyze the SQL query and sample data to determine:
-1. What should be on X-axis (typically date/time)
-2. What should be on Y-axis (typically the metric being measured)
-3. What type of plot (line, bar, scatter)
-
-Respond ONLY in JSON format with these exact fields:
-- x_column: the column name for x-axis
-- y_column: the column name for y-axis
-- plot_type: either "line", "bar", or "scatter"
-- title: a descriptive title for the plot
-
-NO explanations, NO markdown, ONLY JSON.
-
-Example:
-{{"x_column": "day", "y_column": "avg_demand", "plot_type": "line", "title": "Demand Trend"}}
-"""
-        ),
-        ("user", "SQL: {sql}\n\nSample data columns: {columns}\n\nUser request: {query}")
-    ])
-    
-    try:
-        columns = list(sample_rows[0].keys()) if sample_rows else []
-        
-        messages = prompt.format_messages(
-            sql=sql, 
-            columns=columns,
-            query=user_query
-        )
-        response = llm.invoke(messages).content
-        
-        print(f"[GRAPH_METADATA] LLM response: {response}")
-        
-        response = response.replace("```json", "").replace("```", "").strip()
-        metadata = json.loads(response)
-        metadata["sql"] = sql
-        
-        print(f"[GRAPH_METADATA] Parsed metadata: {metadata}")
-        return metadata
-        
-    except Exception as e:
-        print(f"[GRAPH_METADATA] Parse error: {e}, using defaults")
-        
-        if sample_rows:
-            columns = list(sample_rows[0].keys())
-            print(f"[GRAPH_METADATA] Available columns: {columns}")
-            
-            x_col = None
-            y_col = None
-            
-            for col in columns:
-                if any(word in col.lower() for word in ['date', 'time', 'day', 'month']):
-                    x_col = col
-                    break
-            
-            for col in columns:
-                if any(word in col.lower() for word in ['demand', 'value', 'avg', 'sum', 'count']):
-                    y_col = col
-                    break
-            
-            if not x_col:
-                x_col = columns[0] if columns else "date"
-            if not y_col:
-                y_col = columns[1] if len(columns) > 1 else "demand"
-            
-            print(f"[GRAPH_METADATA] Detected columns: x={x_col}, y={y_col}")
-        else:
-            x_col = "datetime"
-            y_col = "demand"
-            
-        return {
-            "sql": sql,
-            "x_column": x_col,
-            "y_column": y_col,
-            "plot_type": "line",
-            "title": "Data Visualization"
-        }
+    return {
+        "sql": sql
+    }
 
 
 # -------------------------
@@ -519,9 +529,6 @@ Rules:
         ),
         ("user", state.user_query),
     ])
-    
-    # Get LLM configured for forecasting agent
-    llm = get_agent_llm("forecasting")
 
     llm_with_tools = llm.bind_tools([nl_to_sql_db_tool])
     response = llm_with_tools.invoke(prompt.format_messages())
@@ -580,9 +587,6 @@ def decision_intelligence_agent(state: GraphState) -> GraphState:
     Maps to 'Decision And Intelligence AGENT' node in flowchart.
     """
     print("[DECISION] Processing decision/intelligence query")
-    
-    # Get LLM configured for this agent
-    llm = get_agent_llm("decision_intelligence")
 
     # Use data if available
     context = ""
@@ -653,9 +657,12 @@ def summarization_agent(state: GraphState) -> GraphState:
     print(f"[SUMMARIZATION] Need graph: {state.need_graph}")
     
     # First, handle graph plotting if needed
-    if state.need_graph and state.graph_data:
+    if state.need_graph:
+        state.graph_data = state.graph_data or {
+            "sql": state.data_ref.get("sql")
+        }
         state = execute_graph_plotting(state)
-    
+
     # Check if there's an error to handle
     if state.data_ref and not state.data_ref.get("ok", True):
         state.final_answer = format_error_message(state)
@@ -698,19 +705,12 @@ def execute_graph_plotting(state: GraphState) -> GraphState:
     print(f"[SUMMARIZATION] Calling graph_plotting_tool with SQL: {sql[:80]}...")
     
     try:
-        plot_result = graph_plotting_tool.invoke({
-            "sql": sql,
-            "x_column": graph_metadata.get("x_column", "date"),
-            "y_column": graph_metadata.get("y_column", "demand"),
-            "plot_type": graph_metadata.get("plot_type", "line"),
-            "title": graph_metadata.get("title", "Data Trend"),
-            "limit": 10000
-        })
+        plot_result = graph_plotting_tool.invoke(sql)
         
         print(f"[SUMMARIZATION] Plot result: ok={plot_result.get('ok')}")
         
         if plot_result.get("ok"):
-            print(f"[SUMMARIZATION] ✓✓✓ PLOT SUCCESS! File: {plot_result['filepath']}")
+            print("[SUMMARIZATION] ✓✓✓ PLOT SUCCESS!")
             state.graph_data = plot_result
             state.graph_data["plot_success"] = True
         else:
@@ -768,9 +768,6 @@ def handle_text_response(state: GraphState) -> str:
 
 def format_data_response(state: GraphState) -> str:
     """Format data query responses using LLM for natural presentation"""
-    # Get LLM configured for summarization agent
-    llm = get_agent_llm("summarization")
-    
     data = state.data_ref or {}
     message_type = data.get("message_type", "unknown")
     
@@ -863,10 +860,10 @@ Create a natural, human-readable response to the user's query.
         if state.graph_data and state.graph_data.get("plot_success"):
             plot_result = state.graph_data
             response += (
-                f"\n\n📈 **Visualization Created**\n"
-                f"I've generated a {plot_result['plot_type']} chart with "
-                f"{plot_result.get('data_points', 0):,} data points."
-            )
+                        "\n\n📈 **Visualization Created**\n"
+                        "A dynamic chart was generated based on your query."
+                    )
+
         elif state.graph_data and not state.graph_data.get("plot_success"):
             response += f"\n\n⚠️ Note: Visualization could not be created: {state.graph_data.get('plot_error', 'Unknown error')}"
         
@@ -899,9 +896,6 @@ def format_data_basic(data: dict, show_tech: bool) -> str:
 
 def format_forecast_response(state: GraphState) -> str:
     """Format forecast responses using LLM"""
-    # Get LLM configured for summarization agent
-    llm = get_agent_llm("summarization")
-    
     data = state.data_ref or {}
     forecast_date = data.get("forecast_date")
     statistics = data.get("statistics", {})
@@ -1017,9 +1011,6 @@ def text_agent(state: GraphState) -> GraphState:
     Handles general text queries that don't require tools.
     """
     print("[TEXT] Handling general query")
-    
-    # Get LLM configured for text agent
-    llm = get_agent_llm("text")
     
     # Handle simple greetings directly
     greetings = ["hi", "hello", "hey", "good morning", "good afternoon", "good evening"]
