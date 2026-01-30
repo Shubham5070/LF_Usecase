@@ -58,3 +58,11 @@ langchain-anthropic>=0.1.0
 
 # Google Gemini
 langchain-google-genai>=1.0.0
+
+# huggingFace
+huggingface_hub
+pandas
+torch
+chronos-forecasting>=2.2.2
+torch>=2.2
+accelerate>=0.34

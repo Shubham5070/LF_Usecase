@@ -3,7 +3,7 @@ from datetime import datetime, date
 import re
 import json
 from state import GraphState
-from tools import nl_to_sql_db_tool, graph_plotting_tool
+from tools import nl_to_sql_db_tool, graph_plotting_tool, execute_query, model_run_tool
 from llm import get_llm
 from agent_llm_config import get_agent_llm
 from data_availability import (
@@ -21,9 +21,15 @@ from data_availability import (
 
 
 # -------------------------
-# LLM
+# LLM (lazy-initialized to avoid heavy imports at module-import time)
 # -------------------------
-llm = get_llm()
+_llm = None
+
+def _get_llm():
+    global _llm
+    if _llm is None:
+        _llm = get_llm()
+    return _llm
 
 # -------------------------
 # HELPERS
@@ -52,80 +58,268 @@ def query_analysis_agent(state: GraphState) -> GraphState:
     Maps to 'Query analysis' node in flowchart.
     """
     print("[QUERY_ANALYSIS] Analyzing user query")
-    
+   
     # Get LLM configured for this agent
     llm = get_agent_llm("query_analysis")
-
+   
+    from datetime import datetime
+    import re
+    # current_date = datetime.now().strftime("%Y-%m-%d")
+    current_date = "2026-01-14"  # Fixed date for consistent testing
+    current_date_readable = datetime.now().strftime("%B %d, %Y")
+   
     prompt = ChatPromptTemplate.from_messages([
         (
             "system",
             """
 You are a query analysis agent for a load forecasting system.
-
-Your task:
-- Classify the user's intent
-- Determine required tools and agents
-
-Intent categories:
-- "data" - Historical data queries to work or fetch data of actual demand, holidays, metrics
-- "forecast" - Future demand predictions from the database provided
-- "decision" - Business intelligence, recommendations, insights, for complex action effort queries
-- "text" - General questions, explanations, definitions
-
-Tool requirements:
-- need_db_call: true if query needs database access (for actual demand, holidays, metrics and forecast value)
-- need_graph: true ONLY if user explicitly asks for: trend, plot, graph, chart, visualize, show variation
-- need_model_run: true if user wants to train/run a new model
-- need_api_call: true if external API data is needed
-
-Rules:
-- Forecast queries ALWAYS need DB
-- Data queries about actual/historical records need DB like for actual demand, holidays, metrics and forecasting values
-- Explanations/definitions do NOT need DB
-- "decision" intent may need DB for data-driven insights
-
-Respond ONLY in valid JSON:
-{{
-  "intent": "<data|forecast|decision|text>",
-  "need_db_call": true,
-  "need_graph": false,
-  "need_model_run": false,
-  "need_api_call": false
-}}
+ 
+TODAY'S DATE: {current_date} ({current_date_readable})
+ 
+DATABASE SCHEMA:
+- t_actual_demand: Actual/real historical demand
+- t_forecasted_demand: Past/future forecasted/predicted demand values (historical predictions)
+- t_holidays: Holiday information
+- t_metrics: Model performance metrics
+ 
+═══════════════════════════════════════════════════════════════
+⚠️  HIGHEST PRIORITY RULE - DATE/TIME BASED ROUTING ⚠️
+═══════════════════════════════════════════════════════════════
+ROUTING RULES:
+ 
+1. GRAPH CHECK (Priority 1):
+   - Keywords: plot, show, graph, chart, visualize, visual, display
+   - If graph → need_graph: true, need_db_call: true
+   - Graph without time → intent: "data"
+   - Graph with time → apply date routing
+   
+STEP 1: IDENTIFY IF QUERY HAS A DATE/TIME REFERENCE
+- Look for: specific dates, "tomorrow", "next week", "last month", "yesterday", etc.
+ 
+STEP 2: DETERMINE IF DATE IS PAST OR FUTURE
+- Compare mentioned date with TODAY ({current_date})
+- If date is BEFORE or EQUAL to {current_date} → PAST
+- If date is AFTER {current_date} → FUTURE
+ 
+STEP 3: ROUTE BASED ON TIME
+- PAST date/time → intent: "data" (even if query mentions "forecast" or "predicted")
+- FUTURE date/time → intent: "forecast"
+ 
+═══════════════════════════════════════════════════════════════
+ 
+EXAMPLES WITH TODAY = {current_date}:
+ 
+Query: "give forecasted demand of 25 june 2025"
+→ Date: 2025-06-25
+→ Comparison: 2025-06-25 is BEFORE {current_date}
+→ Result: intent: "data", need_db_call: true, need_model_run: false
+ 
+Query: "give forecasted demand for tomorrow"
+→ Date: {current_date} + 1 day = FUTURE
+→ Result: intent: "forecast", need_db_call: true, need_model_run: true
+ 
+Query: "what was the forecasted demand on 15 january 2025"
+→ Date: 2025-01-15
+→ Comparison: 2025-01-15 is BEFORE {current_date}
+→ Result: intent: "data", need_db_call: true, need_model_run: false
+ 
+Query: "predict demand for next month"
+→ Date: February 2026 = FUTURE
+→ Result: intent: "forecast", need_db_call: true, need_model_run: true
+ 
+Query: "show me actual demand for last week"
+→ Time: last week = PAST
+→ Result: intent: "data", need_db_call: true, need_model_run: false
+ 
+Query: "forecast for 30 january 2026"
+→ Date: 2026-01-30
+→ Comparison: 2026-01-30 is AFTER {current_date}
+→ Result: intent: "forecast", need_db_call: true, need_model_run: true
+ 
+═══════════════════════════════════════════════════════════════
+ 
+INTENT CLASSIFICATION (AFTER TIME-BASED ROUTING):
+ 
+1. "data" intent → ALL past/historical queries:
+   - Any query with dates BEFORE or EQUAL TO {current_date}
+   - Queries about actual demand from the past
+   - Queries about forecasted demand from the past (stored in t_forecasted_demand)
+   - Queries about holidays, metrics
+   - Time keywords: was, were, last, previous, historical, past, yesterday, [any past date]
+ 
+2. "forecast" intent → ONLY future predictions:
+   - Any query with dates AFTER {current_date}
+   - Queries requesting new predictions for future dates
+   - Time keywords: will, tomorrow, next, upcoming, future, predict for [future date]
+ 
+3. "decision" intent → Business intelligence (can be past or future context):
+   - Comparisons, recommendations, insights
+   - Multi-source analysis
+   - Keywords: compare, recommend, suggest, optimize, should, strategy, what-if
+   - Time-based routing still applies if specific dates mentioned
+ 
+4. "text" intent → General information (no date context):
+   - Explanations, definitions, concepts
+   - No database needed
+   - Keywords: what is, explain, how does, define
+ 
+═══════════════════════════════════════════════════════════════
+ 
+TOOL REQUIREMENTS:
+ 
+need_db_call:
+- true for "data" intent (accessing past data from all tables)
+- true for "forecast" intent (may need historical data + generating predictions)
+- true for "decision" intent (needs data for analysis)
+- false for "text" intent
+ 
+need_graph:
+- true ONLY if explicitly requested: plot, graph, chart, visualize, show trend, visual
+- false otherwise
+ 
+need_model_run:
+- true ONLY for "forecast" intent (generating NEW predictions for FUTURE dates)
+- false for "data" intent (querying EXISTING past data)
+- false for "decision" intent (unless explicitly asking to run model)
+ 
+need_api_call:
+- true if external data needed (weather, events for future predictions)
+- false otherwise
+ 
+═══════════════════════════════════════════════════════════════
+ 
+CRITICAL REMINDERS:
+1. ⚠️  DATE/TIME COMPARISON IS THE FIRST AND MOST IMPORTANT STEP
+2. ⚠️  "June 25, 2025" is BEFORE today ({current_date}), so it's PAST → "data" intent
+3. ⚠️  Even if query says "forecast" or "predict", if date is PAST → "data" intent
+4. ⚠️  Only route to "forecast" if date is genuinely in the FUTURE
+ 
+═══════════════════════════════════════════════════════════════
+ 
+CRITICAL OUTPUT FORMAT - READ CAREFULLY:
+ 
+YOU MUST OUTPUT ONLY THE JSON OBJECT BELOW. NO OTHER TEXT.
+NO explanations. NO markdown. NO code blocks. NO extra words.
+JUST the JSON starting with {{ and ending with }}.
+ 
+{{"intent": "data", "need_db_call": true, "need_graph": true, "need_model_run": false, "need_api_call": false}}
 """
         ),
         ("user", "{query}")
     ])
-
-    response = llm.invoke(
-        prompt.format_messages(query=state.user_query)
+   
+    response = _get_llm().invoke(
+        prompt.format_messages(
+            query=state.user_query,
+            current_date=current_date,
+            current_date_readable=current_date_readable
+        )
     ).content
-
-    print("[QUERY_ANALYSIS] Raw response:", response)
-
-    # Parse JSON response
+   
+    print(f"[QUERY_ANALYSIS] Raw response (length={len(response)}): {repr(response[:500])}")
+   
+    # Parse JSON response with maximum robustness
     try:
-        result = json.loads(response)
-        state.intent = result.get("intent", "text")
-        state.need_db_call = result.get("need_db_call", False)
-        state.need_graph = result.get("need_graph", False)
-        state.need_model_run = result.get("need_model_run", False)
-        state.need_api_call = result.get("need_api_call", False)
-
-    except Exception as e:
-        print("[QUERY_ANALYSIS] Parse error:", e)
+        if not response or not response.strip():
+            raise ValueError("Empty response from LLM")
+       
+        # Clean the response
+        response_cleaned = response.strip()
+       
+        # Remove any BOM or invisible characters at the start
+        response_cleaned = response_cleaned.lstrip('\ufeff\u200b\u200c\u200d')
+       
+        # Remove markdown code blocks
+        if "```json" in response_cleaned:
+            match = re.search(r'```json\s*(\{.*?\})\s*```', response_cleaned, re.DOTALL)
+            if match:
+                response_cleaned = match.group(1).strip()
+        elif "```" in response_cleaned:
+            match = re.search(r'```\s*(\{.*?\})\s*```', response_cleaned, re.DOTALL)
+            if match:
+                response_cleaned = match.group(1).strip()
+       
+        # Extract JSON object using regex if there's extra text
+        json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', response_cleaned, re.DOTALL)
+        if json_match:
+            response_cleaned = json_match.group(0)
+       
+        # Remove any trailing/leading whitespace and newlines
+        response_cleaned = response_cleaned.strip()
+       
+        print(f"[QUERY_ANALYSIS] Cleaned response: {repr(response_cleaned[:200])}")
+       
+        # Try to parse JSON
+        result = json.loads(response_cleaned)
+       
+        # Validate required fields
+        required_fields = ["intent", "need_db_call", "need_graph", "need_model_run", "need_api_call"]
+        missing_fields = [field for field in required_fields if field not in result]
+       
+        if missing_fields:
+            raise ValueError(f"Missing required fields: {missing_fields}")
+       
+        # Validate intent values
+        valid_intents = ["data", "forecast", "decision", "text"]
+        if result["intent"] not in valid_intents:
+            print(f"[QUERY_ANALYSIS] ⚠️  Invalid intent '{result['intent']}', defaulting to 'text'")
+            result["intent"] = "text"
+       
+        # Set state values
+        state.intent = result["intent"]
+        state.need_db_call = bool(result["need_db_call"])
+        state.need_graph = bool(result["need_graph"])
+        state.need_model_run = bool(result["need_model_run"])
+        state.need_api_call = bool(result["need_api_call"])
+       
+        print("[QUERY_ANALYSIS] ✅ Successfully parsed JSON response")
+       
+    except json.JSONDecodeError as e:
+        print(f"[QUERY_ANALYSIS] ❌ JSON Parse error: {e}")
+        print(f"[QUERY_ANALYSIS] Failed at position {e.pos}")
+        print(f"[QUERY_ANALYSIS] Cleaned response bytes: {response_cleaned.encode('utf-8')[:100]}")
+       
+        # Try to extract intent manually as last resort
+        intent_match = re.search(r'"intent"\s*:\s*"(\w+)"', response)
+        if intent_match:
+            state.intent = intent_match.group(1)
+            print(f"[QUERY_ANALYSIS] 🔧 Extracted intent manually: {state.intent}")
+        else:
+            state.intent = "text"
+       
+        # Use fallback values
+        state.need_db_call = False
+        state.need_graph = False
+        state.need_model_run = False
+        state.need_api_call = False
+       
+    except ValueError as e:
+        print(f"[QUERY_ANALYSIS] ❌ Validation error: {e}")
+        print(f"[QUERY_ANALYSIS] Raw response: {repr(response[:300])}")
         state.intent = "text"
         state.need_db_call = False
         state.need_graph = False
-
+        state.need_model_run = False
+        state.need_api_call = False
+       
+    except Exception as e:
+        print(f"[QUERY_ANALYSIS] ❌ Unexpected error: {type(e).__name__}: {e}")
+        print(f"[QUERY_ANALYSIS] Raw response: {repr(response[:300])}")
+        state.intent = "text"
+        state.need_db_call = False
+        state.need_graph = False
+        state.need_model_run = False
+        state.need_api_call = False
+   
     print(
-        f"[QUERY_ANALYSIS] intent={state.intent}, "
+        f"[QUERY_ANALYSIS] Result → intent={state.intent}, "
         f"need_db_call={state.need_db_call}, "
-        f"need_graph={state.need_graph}"
+        f"need_graph={state.need_graph}, "
+        f"need_model_run={state.need_model_run}, "
+        f"need_api_call={state.need_api_call}"
     )
-
     return state
-
+    
 # -------------------------
 # INTENT IDENTIFIER (PLANNER)
 # -------------------------
@@ -297,7 +491,7 @@ CRITICAL: Output ONLY the SQL query. Nothing else.
 
     try:
         messages = prompt.format_messages(sql=original_sql)
-        response = llm.invoke(messages).content
+        response = _get_llm().invoke(messages).content
         
         # Clean up response
         agg_sql = response.strip()
@@ -369,7 +563,10 @@ def forecasting_agent(state: GraphState) -> GraphState:
     print(f"[FORECASTING] Requested date: {requested_date}")
 
     # Range validation
-    if not is_within_range(dt, FORECAST_DATA_START, FORECAST_DATA_END):
+    # IMPORTANT: allow planner-forced model runs even when the requested date
+    # is outside the recorded forecast availability. Only block when the
+    # planner DID NOT request a model run.
+    if not state.need_model_run and not is_within_range(dt, FORECAST_DATA_START, FORECAST_DATA_END):
         state.data_ref = {
             "ok": False,
             "error_type": "out_of_range",
@@ -378,6 +575,59 @@ def forecasting_agent(state: GraphState) -> GraphState:
         }
         state.is_out_of_range = True
         return state
+
+    # If the planner requested a model run, ALWAYS run the model and use ONLY the
+    # predictions produced by that run. Do NOT use pre-existing DB rows even if
+    # they exist for the same date — the planner's request takes precedence.
+    if state.need_model_run:
+        print(f"[FORECASTING] need_model_run=True → forcing model run for {requested_date} (ignoring existing DB predictions)")
+
+        # Force a fresh run (run_and_store_forecast deletes prior rows for the same date)
+        run_result = model_run_tool.invoke(str(requested_date))
+
+        if not run_result.get("ok"):
+            state.data_ref = {
+                "ok": False,
+                "error_type": "model_run_failure",
+                "message": run_result.get("error", "Model run failed")
+            }
+            return state
+
+        # Fetch only the rows for the requested date (these should reflect the run we just performed)
+        fetch_sql = (
+            "SELECT datetime, block, predicted_demand AS forecasted_demand, model_id, generated_at "
+            "FROM t_predicted_demand_chatbot "
+            f"WHERE prediction_date = '{requested_date}' "
+            "ORDER BY datetime"
+        )
+
+        fetch_res = execute_query(fetch_sql)
+        if not fetch_res.get("ok"):
+            state.data_ref = {
+                "ok": False,
+                "error_type": "forecast_fetch_failure",
+                "message": fetch_res.get("error", "Failed to fetch predictions after model run")
+            }
+            return state
+
+        if fetch_res.get("row_count", 0) == 0:
+            state.data_ref = {
+                "ok": False,
+                "error_type": "no_predictions_after_run",
+                "message": "Model run completed but no predictions were saved to the database."
+            }
+            return state
+
+        # Return ONLY the freshly-generated rows and attach run metadata
+        state.data_ref = {
+            "ok": True,
+            "sql": fetch_sql,
+            "rows": fetch_res.get("rows", []),
+            "row_count": fetch_res.get("row_count", 0),
+            "sample_rows": fetch_res.get("rows", [])[:3],
+            "generated_by_run": True,
+            "run_metrics": run_result.get("metrics")
+        }
 
     # If we have data from NL2SQL, use it
     if state.data_ref and state.data_ref.get("ok", True):
@@ -428,7 +678,7 @@ Rules:
         ("user", state.user_query),
     ])
 
-    llm_with_tools = llm.bind_tools([nl_to_sql_db_tool])
+    llm_with_tools = _get_llm().bind_tools([nl_to_sql_db_tool])
     response = llm_with_tools.invoke(prompt.format_messages())
 
     if not response.tool_calls:
@@ -525,7 +775,7 @@ Format your response in a friendly, professional way without excessive formattin
         ("user", "{query}{context}")
     ])
 
-    response = llm.invoke(
+    response = _get_llm().invoke(
         prompt.format_messages(
             query=state.user_query,
             context=context
@@ -747,7 +997,7 @@ Create a natural, human-readable response to the user's query.
             show_technical=show_tech
         )
         
-        response = llm.invoke(messages).content
+        response = _get_llm().invoke(messages).content
         
         # Add technical details if requested
         if show_tech:
@@ -850,13 +1100,19 @@ Create a natural forecast summary.
             user_query=state.user_query
         )
         
-        response = llm.invoke(messages).content
+        response = _get_llm().invoke(messages).content
         
         # Add technical details if requested
         if show_tech:
             sql = data.get("sql", "")
             response += f"\n\n**Technical Details:**\n```sql\n{sql}\n```"
-        
+
+        # If the forecast was produced by a fresh run but no validation metrics
+        # are available (expected for forward-looking forecasts), add a short
+        # clarification instead of attempting to show metrics.
+        if data.get("generated_by_run") and not data.get("run_metrics"):
+            response += "\n\n⚠️ No validation metrics available for forward-looking forecasts (actuals not yet observed)."
+
         # Add graph info if available
         if state.graph_data and state.graph_data.get("plot_success"):
             plot_result = state.graph_data
@@ -864,7 +1120,7 @@ Create a natural forecast summary.
                 f"\n\n📈 **Visualization Created**\n"
                 f"I've generated a {plot_result['plot_type']} chart showing the forecast trend."
             )
-        
+
         return response
         
     except Exception as e:
@@ -949,7 +1205,7 @@ Avoid bullet points unless listing specific items.
         ("user", "{query}")
     ])
 
-    response = llm.invoke(
+    response = _get_llm().invoke(
         prompt.format_messages(query=state.user_query)
     ).content
 

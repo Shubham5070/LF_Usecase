@@ -15,15 +15,15 @@ from typing import Dict, Optional, Any
 AGENT_LLM_CONFIG = {
     # Query Analysis Agent - fast model for classification
     "query_analysis": {
-        "provider": "ollama",  # or "openai", "anthropic", "gemini", "vllm"
-        "model": "llama3.2",
+        "provider": "gemini",  # or "openai", "anthropic", "gemini", "vllm"
+        "model": "gemini-2.5-flash",
         "temperature": 0,
     },
     
     # Intent Identifier Agent
     "intent_identifier": {
-        "provider": "ollama",
-        "model": "llama3.2",
+        "provider": "gemini",  # or "openai", "anthropic", "gemini", "vllm"
+        "model": "gemini-2.5-flash",
         "temperature": 0,
     },
     
@@ -36,37 +36,37 @@ AGENT_LLM_CONFIG = {
     
     # Data Observation Agent
     "data_observation": {
-        "provider": "ollama",
-        "model": "llama3.2",
+        "provider": "gemini",  # or "openai", "anthropic", "gemini", "vllm"
+        "model": "gemini-2.5-flash",
         "temperature": 0,
     },
     
     # Forecasting Agent - needs reasoning
     "forecasting": {
-        "provider": "ollama",
-        "model": "llama3.2",
-        "temperature": 0.2,
+        "provider": "gemini",  # or "openai", "anthropic", "gemini", "vllm"
+        "model": "gemini-2.5-flash",
+        "temperature": 0,
     },
     
     # Decision Intelligence Agent - needs reasoning and insights
     "decision_intelligence": {
-        "provider": "ollama",
-        "model": "llama3.2",
-        "temperature": 0.3,
+        "provider": "gemini",  # or "openai", "anthropic", "gemini", "vllm"
+        "model": "gemini-2.5-flash",
+        "temperature": 0,
     },
     
     # Summarization Agent
     "summarization": {
-        "provider": "ollama",
-        "model": "llama3.2",
+        "provider": "gemini",  # or "openai", "anthropic", "gemini", "vllm"
+        "model": "gemini-2.5-flash",
         "temperature": 0,
     },
     
     # Text Agent - general conversation
     "text": {
-        "provider": "ollama",
-        "model": "llama3.2",
-        "temperature": 0.7,
+        "provider": "gemini",  # or "openai", "anthropic", "gemini", "vllm"
+        "model": "gemini-2.5-flash",
+        "temperature": 0,
     },
 }
 

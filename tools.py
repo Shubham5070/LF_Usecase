@@ -713,15 +713,37 @@ def cleanup_old_plots(days_to_keep: int = 7):
 # ------------------------------------------------------
 
 @tool
-def model_run_tool(model_type: str = "prophet", parameters: Dict[str, Any] = None) -> dict:
+def model_run_tool(run_date: str, model_id: int | None = None, model_path: str | None = None) -> dict:
+    """Run the forecasting pipeline for `run_date` and persist results to the DB.
+
+    Args:
+        run_date: date string in YYYY-MM-DD
+        model_id: optional model identifier to store in DB
+        model_path: optional model repo/path
+
+    Returns:
+        dict with keys: ok, rows_written, prediction_date, model_id, metrics
     """
-    Run a Demand forecasting models.
-    """
-    return {
-        "ok": True,
-        "model_type": model_type,
-        "status": "not_implemented",
-    }
+    try:
+        # Import the programmatic entrypoint from the dedicated module
+        from LF_model_run import run_and_store_forecast
+
+        result = run_and_store_forecast(run_date, model_id=model_id, model_path=model_path)
+
+        if not result.get("ok"):
+            return {"ok": False, "error": result.get("error", "unknown")}
+
+        return {
+            "ok": True,
+            "rows_written": result.get("rows_written", 0),
+            "prediction_date": result.get("prediction_date"),
+            "model_id": result.get("model_id"),
+            "metrics": result.get("metrics"),
+        }
+
+    except Exception as e:
+        import traceback
+        return {"ok": False, "error": str(e), "traceback": traceback.format_exc()}
 
 
 @tool
