@@ -96,7 +96,7 @@ def prepare_train_data(conn, input_date, lby=0, lbm=4, hrs_end=5):
     # Load demand data
     query_load = f"""
         SELECT datetime as ds, demand as y
-        FROM t_actual_demand
+        FROM lf.t_actual_demand
         WHERE datetime >= '{train_start}'
         AND datetime <= '{train_end}' 
         ORDER BY datetime
@@ -262,22 +262,35 @@ def run_and_store_forecast(run_date: str, *, db_path: str | None = None, model_i
     # Create table in a DB-compatible way
     if cfg.get("type") == "postgresql":
         cur = conn.cursor()
+        # prefer the `lf` schema (other code uses lf.*); create it if missing
+        target_schema = "lf"
+        cur.execute('CREATE SCHEMA IF NOT EXISTS "lf"')
+        # check if table exists in the target schema
         cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS t_predicted_demand_chatbot (
-                id BIGSERIAL PRIMARY KEY,
-                model_id INTEGER,
-                prediction_date DATE,
-                generated_at TIMESTAMP WITH TIME ZONE,
-                datetime TIMESTAMP WITH TIME ZONE,
-                block INTEGER,
-                predicted_demand DOUBLE PRECISION,
-                horizon_type TEXT,
-                version TEXT
-            )
-            """
+            "SELECT 1 FROM information_schema.tables WHERE table_schema = %s AND table_name = %s",
+            (target_schema, "t_predicted_demand_chatbot"),
         )
-        conn.commit()
+        if not cur.fetchone():
+            cur.execute(
+                f'''
+                CREATE TABLE "{target_schema}"."t_predicted_demand_chatbot" (
+                    id BIGSERIAL PRIMARY KEY,
+                    model_id INTEGER,
+                    prediction_date DATE,
+                    generated_at TIMESTAMP WITH TIME ZONE,
+                    datetime TIMESTAMP WITH TIME ZONE,
+                    block INTEGER,
+                    predicted_demand DOUBLE PRECISION,
+                    horizon_type TEXT,
+                    version TEXT
+                )
+                '''
+            )
+            conn.commit()
+            print(f"[DB] Created table {target_schema}.t_predicted_demand_chatbot")
+        else:
+            # ensure any pending transactional DDL is visible
+            conn.commit()
     else:
         # sqlite
         cur = conn.cursor()
@@ -355,18 +368,57 @@ def run_and_store_forecast(run_date: str, *, db_path: str | None = None, model_i
         "version": Path(model_path).stem if model_path else "unknown"
     })
 
+    # Around line 376, after table creation, verify it's queryable:
+    if cfg.get("type") == "postgresql":
+        # Verify table exists in correct schema
+        cur.execute(
+            "SELECT COUNT(*) FROM lf.t_predicted_demand_chatbot WHERE 1=0"
+        )
+        print(f"[DB] Verified table lf.t_predicted_demand_chatbot is accessible")
+
     # Delete existing predictions for the same date/model/horizon (idempotent)
     if cfg.get("type") == "postgresql":
-        # psycopg2 uses %s
+        # use schema-qualified name (other queries reference lf.*)
+        schema = "lf"
+        fq_table = f'"{schema}"."t_predicted_demand_chatbot"'
+
+        # Ensure the table exists (defensive — covers cases where table was dropped externally)
         cur.execute(
-            "DELETE FROM t_predicted_demand_chatbot WHERE prediction_date = %s AND model_id = %s AND horizon_type = %s",
+            "SELECT 1 FROM information_schema.tables WHERE table_schema = %s AND table_name = %s",
+            (schema, "t_predicted_demand_chatbot"),
+        )
+        if not cur.fetchone():
+            # create table from the DataFrame-like schema (safe fallback)
+            cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
+            cur.execute(
+                f'''
+                CREATE TABLE "{schema}"."t_predicted_demand_chatbot" (
+                    id BIGSERIAL PRIMARY KEY,
+                    model_id INTEGER,
+                    prediction_date DATE,
+                    generated_at TIMESTAMP WITH TIME ZONE,
+                    datetime TIMESTAMP WITH TIME ZONE,
+                    block INTEGER,
+                    predicted_demand DOUBLE PRECISION,
+                    horizon_type TEXT,
+                    version TEXT
+                )
+                '''
+            )
+            conn.commit()
+            print(f"[DB] Created table {schema}.t_predicted_demand_chatbot (fallback)")
+
+        # delete existing rows from the correct schema-qualified table
+        cur.execute(
+            f"DELETE FROM {fq_table} WHERE prediction_date = %s AND model_id = %s AND horizon_type = %s",
             (run_date, model_id, horizon_type),
         )
         conn.commit()
 
-        # Bulk insert using executemany (avoid passing raw DB-API conn into pandas.to_sql)
+        # Bulk insert using execute_batch for performance
+        from psycopg2.extras import execute_batch
         insert_sql = (
-            "INSERT INTO t_predicted_demand_chatbot"
+            f"INSERT INTO {fq_table}"
             "(model_id, prediction_date, generated_at, datetime, block, predicted_demand, horizon_type, version)"
             " VALUES (%s, %s, %s, %s, %s, %s, %s, %s)"
         )
@@ -381,10 +433,11 @@ def run_and_store_forecast(run_date: str, *, db_path: str | None = None, model_i
                 r.horizon_type,
                 r.version,
             )
-            for r in result_df.itertuples()
+            for r in result_df.itertuples(index=False)
         ]
-        cur.executemany(insert_sql, rows)
-        conn.commit()
+        if rows:
+            execute_batch(cur, insert_sql, rows, page_size=200)
+            conn.commit()
 
     else:
         # sqlite path: use pandas.to_sql (sqlite3 connection supported)
@@ -401,7 +454,6 @@ def run_and_store_forecast(run_date: str, *, db_path: str | None = None, model_i
             if_exists="append",
             index=False,
         )
-
     rows_written = len(result_df)
 
     # Close DB connection

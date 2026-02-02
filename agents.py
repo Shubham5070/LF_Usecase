@@ -20,7 +20,8 @@ from data_availability import (
     is_within_range,
     build_out_of_range_message,
 )
-
+import os
+DB_TYPE = os.getenv("DB_TYPE", "sqlite").lower()
 
 # -------------------------
 # LLM (lazy-initialized to avoid heavy imports at module-import time)
@@ -755,12 +756,21 @@ def forecasting_agent(state: GraphState) -> GraphState:
             return state
 
         # Fetch predictions from DB
-        fetch_sql = (
-            "SELECT datetime, block, predicted_demand AS forecasted_demand, model_id, generated_at "
-            "FROM t_predicted_demand_chatbot "
-            f"WHERE prediction_date = '{requested_date}' "
-            "ORDER BY datetime"
-        )
+        # To this (with proper schema prefix):
+        if DB_TYPE == "postgresql":
+            fetch_sql = (
+                "SELECT datetime, block, predicted_demand AS forecasted_demand, model_id, generated_at "
+                "FROM lf.t_predicted_demand_chatbot "
+                f"WHERE prediction_date = '{requested_date}' "
+                "ORDER BY datetime"
+            )
+        else:
+            fetch_sql = (
+                "SELECT datetime, block, predicted_demand AS forecasted_demand, model_id, generated_at "
+                "FROM t_predicted_demand_chatbot "
+                f"WHERE prediction_date = '{requested_date}' "
+                "ORDER BY datetime"
+            )
 
         fetch_res = execute_query(fetch_sql)
         if not fetch_res.get("ok"):

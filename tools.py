@@ -239,10 +239,18 @@ TABLES & COLUMNS:
    - forecasted_demand (real number, MW)
    - model_id (text)
 
-3. {schema}t_holidays
+3. {schema}t_predicted_demand_chatbot  # NEW TABLE
+   - datetime (timestamp)
+   - prediction_date (date)
+   - block (integer 1-96)
+   - predicted_demand (real number, MW)
+   - model_id (integer)
+   - generated_at (timestamp)
+
+4. {schema}t_holidays
    - date, name, normal_holiday, special_day
 
-4. {schema}t_metrics
+5. {schema}t_metrics
    - date, mape, rmse, model_id
 
 QUERY PATTERNS:
