@@ -7,7 +7,7 @@ import json
 from state import GraphState
 from tools import nl_to_sql_db_tool, graph_plotting_tool, execute_query, model_run_tool
 from llm import get_llm
-from agent_llm_config import get_agent_llm
+from agent_llm_config import get_agent_llm, get_agent_model_name
 from data_availability import (
     ACTUAL_DATA_START,
     ACTUAL_DATA_END,
@@ -51,6 +51,73 @@ def should_show_technical_details(query: str) -> bool:
     ]
     return any(keyword in query.lower() for keyword in technical_keywords)
 
+
+# Helper: stage-aware printing that can optionally include the LLM model name
+def _env_bool(name: str, default: bool) -> bool:
+    v = __import__("os").environ.get(name)
+    if v is None:
+        return default
+    return str(v).lower() not in ("0", "false", "no")
+
+
+def _model_name_from_llm(llm) -> str | None:
+    """Try common attributes to extract a concise model name from an LLM instance."""
+    if not llm:
+        return None
+    for attr in ("model", "model_name", "name"):
+        val = getattr(llm, attr, None)
+        if val:
+            return str(val)
+    # best-effort from repr
+    try:
+        s = str(llm)
+        import re
+        m = re.search(r"model=['\"]?([^'\")]+)", s)
+        if m:
+            return m.group(1)
+        return s
+    except Exception:
+        return None
+
+
+def stage_print(stage: str, msg: str, *, llm=None, model_name: str | None = None) -> None:
+    """Print to stdout with an optional [STAGE][MODEL] tag controlled by env vars.
+
+    Prefer an explicit `model_name` (reads from config) to avoid instantiating LLMs.
+
+    Env vars:
+      LOG_SHOW_LLM_MODEL (bool, default: true) - globally enable/disable model tags
+      LOG_SHOW_LLM_MODEL_STAGES (comma list) - if set, only show model for these stages (e.g. SUMMARIZATION)
+    """
+    import os
+    stage_up = stage.upper()
+    show_models = _env_bool("LOG_SHOW_LLM_MODEL", True)
+    stages_raw = os.environ.get("LOG_SHOW_LLM_MODEL_STAGES", "")
+    stages_set = {s.strip().upper() for s in stages_raw.split(",") if s.strip()} if stages_raw else set()
+
+    model_tag = ""
+    if show_models and (not stages_set or stage_up in stages_set):
+        # explicit model_name takes precedence
+        resolved = model_name or (_model_name_from_llm(llm) if llm is not None else None)
+        if not resolved:
+            # best-effort: try agent config (non-instantiating) if available
+            try:
+                from agent_llm_config import get_agent_model_name as _cfg_model
+                resolved = _cfg_model(stage.lower())
+            except Exception:
+                resolved = None
+        if not resolved:
+            # last resort: global getter
+            try:
+                from llm import get_llm as _getllm
+                resolved = _model_name_from_llm(_getllm())
+            except Exception:
+                resolved = None
+        if resolved:
+            model_tag = f"[{str(resolved).split(':')[0].upper()}]"
+
+    print(f"[{stage_up}]{model_tag} {msg}")
+
 # -------------------------
 # QUERY ANALYSIS AGENT (Entry Point)
 # -------------------------
@@ -82,19 +149,17 @@ def query_analysis_agent(state: GraphState) -> GraphState:
    
     if rule_result["confident"]:
         # Rule-based classification is confident
-        print(f"[QUERY_ANALYSIS] ✅ RULE-BASED classification (confidence: {rule_result['confidence_reason']})")
+        stage_print("QUERY_ANALYSIS", f"✅ RULE-BASED classification (confidence: {rule_result['confidence_reason']})", model_name=get_agent_model_name("query_analysis"))
         state.intent = rule_result["intent"]
         state.need_db_call = rule_result["need_db_call"]
         state.need_graph = rule_result["need_graph"]
         state.need_model_run = rule_result["need_model_run"]
         state.need_api_call = rule_result["need_api_call"]
        
-        print(
-            f"[QUERY_ANALYSIS] Result → intent={state.intent}, "
-            f"need_db_call={state.need_db_call}, "
-            f"need_graph={state.need_graph}, "
-            f"need_model_run={state.need_model_run}, "
-            f"need_api_call={state.need_api_call}"
+        stage_print(
+            "QUERY_ANALYSIS",
+            f"Result → intent={state.intent}, need_db_call={state.need_db_call}, need_graph={state.need_graph}, need_model_run={state.need_model_run}, need_api_call={state.need_api_call}",
+            model_name=get_agent_model_name("query_analysis")
         )
         return state
    
@@ -102,7 +167,7 @@ def query_analysis_agent(state: GraphState) -> GraphState:
     # PHASE 2: LLM-BASED CLASSIFICATION (for ambiguous cases)
     # ═══════════════════════════════════════════════════════════
    
-    print(f"[QUERY_ANALYSIS] 🤖 LLM-BASED classification (reason: {rule_result['confidence_reason']})")
+    stage_print(f"QUERY_ANALYSIS", f"🤖 LLM-BASED classification (reason: {rule_result['confidence_reason']})", model_name=get_agent_model_name("query_analysis"))
    
     llm = get_agent_llm("query_analysis")
    
@@ -163,12 +228,12 @@ OUTPUT FORMAT: Return ONLY valid JSON, no other text.
         )
     ).content
    
-    print(f"[QUERY_ANALYSIS] Raw LLM response (length={len(response)}): {repr(response[:300])}")
+    stage_print(f"QUERY_ANALYSIS", f"Raw LLM response (length={len(response)}): {repr(response[:300])}", model_name=get_agent_model_name("query_analysis"))
    
     # Parse LLM response
     try:
         response_cleaned = _extract_json_from_response(response)
-        print(f"[QUERY_ANALYSIS] Cleaned response: {repr(response_cleaned[:200])}")
+        stage_print(f"QUERY_ANALYSIS", f"Cleaned response: {repr(response_cleaned[:200])}", model_name=get_agent_model_name("query_analysis"))
        
         result = json.loads(response_cleaned)
        
@@ -190,8 +255,8 @@ OUTPUT FORMAT: Return ONLY valid JSON, no other text.
         print("[QUERY_ANALYSIS] ✅ Successfully parsed LLM response")
        
     except Exception as e:
-        print(f"[QUERY_ANALYSIS] ❌ LLM parsing failed: {e}")
-        print(f"[QUERY_ANALYSIS] Falling back to rule-based result")
+        stage_print("QUERY_ANALYSIS", f"❌ LLM parsing failed: {e}", model_name=get_agent_model_name("query_analysis"))
+        stage_print("QUERY_ANALYSIS", "Falling back to rule-based result", model_name=get_agent_model_name("query_analysis"))
        
         # Use rule-based result as fallback even if not confident
         state.intent = rule_result["intent"]
@@ -200,12 +265,10 @@ OUTPUT FORMAT: Return ONLY valid JSON, no other text.
         state.need_model_run = rule_result["need_model_run"]
         state.need_api_call = rule_result["need_api_call"]
    
-    print(
-        f"[QUERY_ANALYSIS] Result → intent={state.intent}, "
-        f"need_db_call={state.need_db_call}, "
-        f"need_graph={state.need_graph}, "
-        f"need_model_run={state.need_model_run}, "
-        f"need_api_call={state.need_api_call}"
+    stage_print(
+        "QUERY_ANALYSIS",
+        f"Result → intent={state.intent}, need_db_call={state.need_db_call}, need_graph={state.need_graph}, need_model_run={state.need_model_run}, need_api_call={state.need_api_call}",
+        model_name=get_agent_model_name("query_analysis")
     )
     return state
  
@@ -425,8 +488,8 @@ def intent_identifier_agent(state: GraphState) -> GraphState:
     Plans execution path based on query analysis.
     Maps to 'Intent Identifier (Planner)' node in flowchart.
     """
-    print("[PLANNER] Planning execution path")
-    print(f"[PLANNER] Execution plan: intent={state.intent}")
+    stage_print("PLANNER", "Planning execution path", model_name=get_agent_model_name("intent_identifier"))
+    stage_print("PLANNER", f"Execution plan: intent={state.intent}", model_name=get_agent_model_name("intent_identifier"))
     return state
 
 
@@ -438,8 +501,8 @@ def nl_to_sql_agent(state: GraphState) -> GraphState:
     Converts natural language to SQL and executes query.
     Maps to 'NL to SQL AGENT' node in flowchart.
     """
-    print("[NL2SQL] Converting query to SQL")
-    print(f"[NL2SQL] Calling DB tool with query: {state.user_query}")
+    stage_print("NL2SQL", "Converting query to SQL", model_name=get_agent_model_name("nl_to_sql"))
+    stage_print("NL2SQL", f"Calling DB tool with query: {state.user_query}", model_name=get_agent_model_name("nl_to_sql"))
     
     tool_result = nl_to_sql_db_tool.invoke(state.user_query)
 
@@ -454,12 +517,12 @@ def nl_to_sql_agent(state: GraphState) -> GraphState:
         return state
 
     state.data_ref = tool_result
-    print(f"[NL2SQL] Success: {tool_result.get('row_count', 0)} rows retrieved")
+    stage_print("NL2SQL", f"Success: {tool_result.get('row_count', 0)} rows retrieved", model_name=get_agent_model_name("nl_to_sql"))
     
     # IMPROVED: Store SQL for graph generation if needed
     sql = tool_result.get("sql", "")
     if state.need_graph and sql:
-        print("[NL2SQL] Storing SQL for graph generation")
+        stage_print("NL2SQL", "Storing SQL for graph generation", model_name=get_agent_model_name("nl_to_sql"))
         state.graph_data = {
             "sql": sql,
             "user_query": state.user_query
@@ -476,7 +539,7 @@ def data_observation_agent(state: GraphState) -> GraphState:
     Handles historical data queries and observations.
     Maps to 'Data and observation AGENT' node in flowchart.
     """
-    print("[DATA_OBSERVATION] Processing data query")
+    stage_print("DATA_OBSERVATION", "Processing data query", model_name=get_agent_model_name("data_observation"))
 
     # Check if we already have data from NL2SQL
     if state.data_ref and state.data_ref.get("ok", True):
@@ -490,14 +553,14 @@ def data_observation_agent(state: GraphState) -> GraphState:
             state.data_ref["message_type"] = "no_data"
             return state
 
-        print(f"[DATA_OBSERVATION] Dataset has {row_count} rows")
+        stage_print("DATA_OBSERVATION", f"Dataset has {row_count} rows", model_name=get_agent_model_name("data_observation"))
 
         # For large datasets (>100 rows), generate aggregation query
         if row_count > 100:
-            print("[DATA_OBSERVATION] Large dataset detected - generating aggregation")
+            stage_print("DATA_OBSERVATION", "Large dataset detected - generating aggregation", model_name=get_agent_model_name("data_observation"))
             
             agg_sql = generate_aggregation_query(sql, state.user_query)
-            print(f"[DATA_OBSERVATION] Aggregation SQL: {agg_sql}")
+            stage_print("DATA_OBSERVATION", f"Aggregation SQL: {agg_sql}", model_name=get_agent_model_name("data_observation"))
             
             from tools import execute_aggregation_query
             agg_result = execute_aggregation_query(agg_sql)
@@ -513,7 +576,7 @@ def data_observation_agent(state: GraphState) -> GraphState:
 
         # IMPROVED: Prepare graph data if needed
         if state.need_graph and sql:
-            print("[DATA_OBSERVATION] Storing SQL for graph generation")
+            stage_print("DATA_OBSERVATION", "Storing SQL for graph generation", model_name=get_agent_model_name("data_observation"))
             state.graph_data = {
                 "sql": sql,
                 "user_query": state.user_query
@@ -522,7 +585,7 @@ def data_observation_agent(state: GraphState) -> GraphState:
         return state
 
     # If no data yet, call NL2SQL tool
-    print("[DATA_OBSERVATION] Calling DB tool")
+    stage_print("DATA_OBSERVATION", "Calling DB tool", model_name=get_agent_model_name("data_observation"))
     tool_result = nl_to_sql_db_tool.invoke(state.user_query)
 
     if not tool_result.get("ok", False):
@@ -871,21 +934,21 @@ def summarization_agent(state: GraphState) -> GraphState:
     Processes data from all agents and creates human-readable outputs.
     Maps to 'Summarization AGENT' node in flowchart.
     """
-    print("[SUMMARIZATION] Processing response for frontend delivery")
-    print(f"[SUMMARIZATION] Intent: {state.intent}")
-    print(f"[SUMMARIZATION] Has data_ref: {state.data_ref is not None}")
-    print(f"[SUMMARIZATION] Need graph: {state.need_graph}")
-    print(f"[SUMMARIZATION] Has graph_data: {state.graph_data is not None}")
+    stage_print("SUMMARIZATION", "Processing response for frontend delivery", llm=_get_llm())
+    stage_print("SUMMARIZATION", f"Intent: {state.intent}", llm=_get_llm())
+    stage_print("SUMMARIZATION", f"Has data_ref: {state.data_ref is not None}", llm=_get_llm())
+    stage_print("SUMMARIZATION", f"Need graph: {state.need_graph}", llm=_get_llm())
+    stage_print("SUMMARIZATION", f"Has graph_data: {state.graph_data is not None}", llm=_get_llm())
     
     # IMPROVED: Execute graph plotting if needed AND we have data
     if state.need_graph and state.graph_data and state.graph_data.get("sql"):
-        print("[SUMMARIZATION] ✓ Executing graph plotting")
+        stage_print("SUMMARIZATION", "✓ Executing graph plotting", llm=_get_llm())
         state = execute_graph_plotting(state)
     elif state.need_graph:
-        print(f"[SUMMARIZATION] ⚠️ Graph needed but missing data:")
-        print(f"  - has graph_data: {state.graph_data is not None}")
+        stage_print("SUMMARIZATION", f"⚠️ Graph needed but missing data:", llm=_get_llm())
+        stage_print("SUMMARIZATION", f"  - has graph_data: {state.graph_data is not None}", llm=_get_llm())
         if state.graph_data:
-            print(f"  - has SQL: {state.graph_data.get('sql') is not None}")
+            stage_print("SUMMARIZATION", f"  - has SQL: {state.graph_data.get('sql') is not None}", llm=_get_llm())
 
     # Check if there's an error to handle
     if state.data_ref and not state.data_ref.get("ok", True):
@@ -909,9 +972,9 @@ def summarization_agent(state: GraphState) -> GraphState:
     else:
         state.final_answer = state.final_answer or "I've processed your request."
     
-    print(f"[SUMMARIZATION] Final answer ready: {len(state.final_answer)} chars")
+    stage_print("SUMMARIZATION", f"Final answer ready: {len(state.final_answer)} chars", llm=_get_llm())
     if state.graph_data:
-        print(f"[SUMMARIZATION] Graph status: {state.graph_data.get('ok', False)}")
+        stage_print("SUMMARIZATION", f"Graph status: {state.graph_data.get('ok', False)}", llm=_get_llm())
     
     return state
 
@@ -1096,7 +1159,7 @@ Create a natural, human-readable response to the user's query.
         return response
         
     except Exception as e:
-        print(f"[SUMMARIZATION] LLM formatting error: {e}")
+        stage_print("SUMMARIZATION", f"LLM formatting error: {e}", llm=_get_llm())
         return format_data_basic(data, show_tech)
 
 
@@ -1196,7 +1259,7 @@ Create a natural forecast summary.
         return response
         
     except Exception as e:
-        print(f"[SUMMARIZATION] Forecast formatting error: {e}")
+        stage_print("SUMMARIZATION", f"Forecast formatting error: {e}", llm=_get_llm())
         return (
             f"🔮 **Forecast for {forecast_date}**\n\n"
             f"Expected electricity demand:\n"

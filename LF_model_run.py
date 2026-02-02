@@ -256,24 +256,47 @@ def run_and_store_forecast(run_date: str, *, db_path: str | None = None, model_i
     # Use DatabaseFactory for portability
     from db_factory import DatabaseFactory
 
+    cfg = DatabaseFactory.get_config()
     conn = DatabaseFactory.get_connection()
-    cursor = conn.cursor()
 
-    # Ensure output table
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS t_predicted_demand_chatbot (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        model_id INTEGER,
-        prediction_date TEXT,
-        generated_at TEXT,
-        datetime TEXT,
-        block INTEGER,
-        predicted_demand REAL,
-        horizon_type TEXT,
-        version TEXT
-    )
-    """)
-    conn.commit()
+    # Create table in a DB-compatible way
+    if cfg.get("type") == "postgresql":
+        cur = conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS t_predicted_demand_chatbot (
+                id BIGSERIAL PRIMARY KEY,
+                model_id INTEGER,
+                prediction_date DATE,
+                generated_at TIMESTAMP WITH TIME ZONE,
+                datetime TIMESTAMP WITH TIME ZONE,
+                block INTEGER,
+                predicted_demand DOUBLE PRECISION,
+                horizon_type TEXT,
+                version TEXT
+            )
+            """
+        )
+        conn.commit()
+    else:
+        # sqlite
+        cur = conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS t_predicted_demand_chatbot (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                model_id INTEGER,
+                prediction_date TEXT,
+                generated_at TEXT,
+                datetime TEXT,
+                block INTEGER,
+                predicted_demand REAL,
+                horizon_type TEXT,
+                version TEXT
+            )
+            """
+        )
+        conn.commit()
 
     # Initialize Chronos pipeline
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -322,8 +345,8 @@ def run_and_store_forecast(run_date: str, *, db_path: str | None = None, model_i
 
     # Format result dataframe
     result_df = pd.DataFrame({
-        "prediction_date": run_date,
-        "generated_at": datetime.now().isoformat(),
+        "prediction_date": pd.to_datetime(run_date).date(),
+        "generated_at": pd.Timestamp.utcnow().isoformat(),
         "datetime": forecast_index.astype(str),
         "block": forecast_index.hour * (int(BLOCKS_PER_DAY / 24)) + forecast_index.minute // (int(1440 / BLOCKS_PER_DAY)) + 1,
         "predicted_demand": predictions,
@@ -333,27 +356,59 @@ def run_and_store_forecast(run_date: str, *, db_path: str | None = None, model_i
     })
 
     # Delete existing predictions for the same date/model/horizon (idempotent)
-    cursor.execute(
-        """
-        DELETE FROM t_predicted_demand_chatbot
-        WHERE prediction_date = ?
-          AND model_id = ?
-          AND horizon_type = ?
-        """,
-        (run_date, model_id, horizon_type)
-    )
-    conn.commit()
+    if cfg.get("type") == "postgresql":
+        # psycopg2 uses %s
+        cur.execute(
+            "DELETE FROM t_predicted_demand_chatbot WHERE prediction_date = %s AND model_id = %s AND horizon_type = %s",
+            (run_date, model_id, horizon_type),
+        )
+        conn.commit()
 
-    # Insert new predictions
-    result_df.to_sql(
-        "t_predicted_demand_chatbot",
-        conn,
-        if_exists="append",
-        index=False
-    )
+        # Bulk insert using executemany (avoid passing raw DB-API conn into pandas.to_sql)
+        insert_sql = (
+            "INSERT INTO t_predicted_demand_chatbot"
+            "(model_id, prediction_date, generated_at, datetime, block, predicted_demand, horizon_type, version)"
+            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s)"
+        )
+        rows = [
+            (
+                int(r.model_id),
+                pd.to_datetime(r.prediction_date).date(),
+                pd.to_datetime(r.generated_at).to_pydatetime(),
+                pd.to_datetime(r.datetime).to_pydatetime(),
+                int(r.block),
+                float(r.predicted_demand),
+                r.horizon_type,
+                r.version,
+            )
+            for r in result_df.itertuples()
+        ]
+        cur.executemany(insert_sql, rows)
+        conn.commit()
+
+    else:
+        # sqlite path: use pandas.to_sql (sqlite3 connection supported)
+        # Use parameterized DELETE for sqlite as well
+        cur.execute(
+            "DELETE FROM t_predicted_demand_chatbot WHERE prediction_date = ? AND model_id = ? AND horizon_type = ?",
+            (str(run_date), model_id, horizon_type),
+        )
+        conn.commit()
+
+        result_df.to_sql(
+            "t_predicted_demand_chatbot",
+            conn,
+            if_exists="append",
+            index=False,
+        )
+
     rows_written = len(result_df)
 
-    conn.close()
+    # Close DB connection
+    try:
+        conn.close()
+    except Exception:
+        pass
 
     return {
         "ok": True,

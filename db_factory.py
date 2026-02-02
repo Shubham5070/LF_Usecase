@@ -82,6 +82,34 @@ class DatabaseFactory:
                 "path": os.getenv("SQLITE_DB_PATH", "./data/load_forecasting.db")
             }
 
+    @staticmethod
+    def get_engine(db_type: Optional[str] = None):
+        """Return a lightweight SQLAlchemy engine string when available or None.
+
+        This helper does NOT require SQLAlchemy at import-time; it will only
+        attempt to create an engine if SQLAlchemy is installed. It is useful
+        for passing a supported "connectable" to pandas.to_sql when available.
+        """
+        db_type = db_type or os.getenv("DB_TYPE", "sqlite").lower()
+        cfg = DatabaseFactory.get_config()
+
+        try:
+            from sqlalchemy import create_engine
+        except Exception:
+            return None
+
+        if cfg["type"] == "postgresql":
+            user = cfg.get("user") or "postgres"
+            password = cfg.get("password", "")
+            host = cfg.get("host", "localhost")
+            port = cfg.get("port", 5432)
+            dbname = cfg.get("dbname")
+            url = f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{dbname}"
+            return create_engine(url)
+        else:
+            path = cfg.get("path", "./data/load_forecasting.db")
+            return create_engine(f"sqlite:///{path}")
+
 
 def get_db_connection():
     """Convenience function to get database connection"""

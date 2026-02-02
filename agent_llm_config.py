@@ -16,14 +16,14 @@ AGENT_LLM_CONFIG = {
     # Query Analysis Agent - fast model for classification
     "query_analysis": {
         "provider": "ollama",  # or "openai", "anthropic", "gemini", "vllm"
-        "model": "llama3.2:latest",
+        "model": "qwen2.5:latest",
         "temperature": 0,
     },
     
     # Intent Identifier Agent
     "intent_identifier": {
         "provider": "ollama",  # or "openai", "anthropic", "gemini", "vllm"
-        "model": "llama3.2:latest",
+        "model": "qwen2.5:latest",
         "temperature": 0,
     },
     
@@ -37,35 +37,35 @@ AGENT_LLM_CONFIG = {
     # Data Observation Agent
     "data_observation": {
         "provider": "ollama",  # or "openai", "anthropic", "gemini", "vllm"
-        "model": "llama3.2:latest",
+        "model": "qwen2.5:latest",
         "temperature": 0,
     },
     
     # Forecasting Agent - needs reasoning
     "forecasting": {
         "provider": "ollama",  # or "openai", "anthropic", "gemini", "vllm"
-        "model": "llama3.2:latest",
+        "model": "qwen2.5:latest",
         "temperature": 0,
     },
     
     # Decision Intelligence Agent - needs reasoning and insights
     "decision_intelligence": {
         "provider": "ollama",  # or "openai", "anthropic", "gemini", "vllm"
-        "model": "llama3.2:latest",
+        "model": "qwen2.5:latest",
         "temperature": 0,
     },
     
     # Summarization Agent
     "summarization": {
         "provider": "ollama",  # or "openai", "anthropic", "gemini", "vllm"
-        "model": "llama3.2:latest",
+        "model": "qwen2.5:latest",
         "temperature": 0,
     },
     
     # Text Agent - general conversation
     "text": {
         "provider": "ollama",  # or "openai", "anthropic", "gemini", "vllm"
-        "model": "llama3.2:latest",
+        "model": "qwen2.5:latest",
         "temperature": 0,
     },
 }
@@ -122,6 +122,18 @@ def get_agent_llm(agent_name: str) -> BaseChatModel:
           f"{config.get('provider')}/{config.get('model')}")
     
     return llm
+
+
+def get_agent_model_name(agent_name: str) -> str | None:
+    """Return the configured model name for an agent from AGENT_LLM_CONFIG without creating an instance.
+
+    Returns a short string (e.g. 'qwen2.5:latest') or None if not configured.
+    """
+    cfg = AGENT_LLM_CONFIG.get(agent_name)
+    if not cfg:
+        return None
+    model = cfg.get("model")
+    return model
 
 
 def update_agent_llm_config(
