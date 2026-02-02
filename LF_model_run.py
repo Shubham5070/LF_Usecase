@@ -88,15 +88,24 @@ def dedupe_index(df, keep="first"):
 # DATA PREPARATION FUNCTIONS
 # ------------------------------------------------
 def prepare_train_data(conn, input_date, lby=0, lbm=4, hrs_end=5):
+    from db_factory import DatabaseFactory
+    cfg = DatabaseFactory.get_config()
+    is_postgres = cfg.get("type") == "postgresql"
+    
     ip_date = pd.to_datetime(input_date)
     train_start = (ip_date + pd.Timedelta(hours=hrs_end, minutes=45) 
                    - pd.DateOffset(years=lby, months=lbm, days=1))
     train_end = ip_date + pd.Timedelta(hours=hrs_end, minutes=45) - pd.DateOffset(days=1)
     
+    # Schema-qualified table names for PostgreSQL
+    actual_demand_table = "lf.t_actual_demand" if is_postgres else "t_actual_demand"
+    actual_weather_table = "lf.t_actual_weather" if is_postgres else "t_actual_weather"
+    holidays_table = "lf.t_holidays" if is_postgres else "t_holidays"
+    
     # Load demand data
     query_load = f"""
         SELECT datetime as ds, demand as y
-        FROM lf.t_actual_demand
+        FROM {actual_demand_table}
         WHERE datetime >= '{train_start}'
         AND datetime <= '{train_end}' 
         ORDER BY datetime
@@ -106,7 +115,7 @@ def prepare_train_data(conn, input_date, lby=0, lbm=4, hrs_end=5):
     # Load weather data
     query_weather = f"""
         SELECT datetime as ds, humidity, temp
-        FROM t_actual_weather
+        FROM {actual_weather_table}
         WHERE datetime >= '{train_start}' 
         AND datetime <= '{train_end}'
         ORDER BY datetime
@@ -117,10 +126,10 @@ def prepare_train_data(conn, input_date, lby=0, lbm=4, hrs_end=5):
     dflw = dfl.merge(dfw, on="ds", how="left")
     dflw["date"] = pd.to_datetime(dflw["ds"].dt.date)
     
-    # Load holidays - removed day_of_week column
+    # Load holidays
     query_holidays = f"""
         SELECT date, name, normal_holiday, special_day
-        FROM t_holidays
+        FROM {holidays_table}
         WHERE date >= '{train_start.date()}'  
         AND date <= '{train_end.date()}'
         ORDER BY date
@@ -133,14 +142,14 @@ def prepare_train_data(conn, input_date, lby=0, lbm=4, hrs_end=5):
     dflwh = dflw.merge(dfh, on=["date"], how="left")
     dflwh.fillna(0, inplace=True)
     
-    # Set index before creating cyclic features (to get day_of_week from index)
+    # Set index before creating cyclic features
     dflwh.set_index("ds", inplace=True)
     dflwh.sort_index(inplace=True)
     
-    # Create cyclic features (this will create day_of_week from index)
+    # Create cyclic features
     df = create_cyclic_features(dflwh)
     
-    # Feature engineering (now day_of_week exists)
+    # Feature engineering
     df["hour"] = df.index.hour + 1
     
     # Convert to proper pandas Series for comparison
@@ -166,14 +175,23 @@ def prepare_train_data(conn, input_date, lby=0, lbm=4, hrs_end=5):
     return df
 
 def prepare_test_data(conn, input_date, hrs_start=6):
+    from db_factory import DatabaseFactory
+    cfg = DatabaseFactory.get_config()
+    is_postgres = cfg.get("type") == "postgresql"
+    
     ip_date = pd.to_datetime(input_date)
     test_start = ip_date + pd.Timedelta(hours=hrs_start) - pd.DateOffset(days=1)
     test_end = ip_date + pd.Timedelta(hours=23, minutes=45)
     
+    # Schema-qualified table names for PostgreSQL
+    actual_demand_table = "lf.t_actual_demand" if is_postgres else "t_actual_demand"
+    forecasted_weather_table = "lf.t_forecasted_weather" if is_postgres else "t_forecasted_weather"
+    holidays_table = "lf.t_holidays" if is_postgres else "t_holidays"
+    
     # Load actual demand
     query_load = f"""
         SELECT datetime as ds, demand as y
-        FROM t_actual_demand
+        FROM {actual_demand_table}
         WHERE datetime >= '{test_start}'
         AND datetime <= '{test_end}' 
         ORDER BY datetime
@@ -183,7 +201,7 @@ def prepare_test_data(conn, input_date, hrs_start=6):
     # Load forecasted weather
     query_weather = f"""
         SELECT datetime as ds, date, humidity, temp
-        FROM t_forecasted_weather
+        FROM {forecasted_weather_table}
         WHERE datetime >= '{test_start}' 
         AND datetime <= '{test_end}'
         ORDER BY datetime
@@ -194,10 +212,10 @@ def prepare_test_data(conn, input_date, hrs_start=6):
     dflw = dfl.merge(dfw, on="ds", how="left")
     dflw["date"] = pd.to_datetime(dflw["ds"].dt.date)
     
-    # Load holidays - removed day_of_week column
+    # Load holidays
     query_holidays = f"""
         SELECT date, name, normal_holiday, special_day
-        FROM t_holidays
+        FROM {holidays_table}
         WHERE date >= '{test_start.date()}'  
         AND date <= '{test_end.date()}'
         ORDER BY date
@@ -214,7 +232,7 @@ def prepare_test_data(conn, input_date, hrs_start=6):
     dflwh.set_index("ds", inplace=True)
     dflwh.sort_index(inplace=True)
     
-    # Create cyclic features (this will create day_of_week from index)
+    # Create cyclic features
     df = create_cyclic_features(dflwh)
     
     # Feature engineering
@@ -368,9 +386,8 @@ def run_and_store_forecast(run_date: str, *, db_path: str | None = None, model_i
         "version": Path(model_path).stem if model_path else "unknown"
     })
 
-    # Around line 376, after table creation, verify it's queryable:
+    # Verify table is queryable
     if cfg.get("type") == "postgresql":
-        # Verify table exists in correct schema
         cur.execute(
             "SELECT COUNT(*) FROM lf.t_predicted_demand_chatbot WHERE 1=0"
         )
@@ -378,11 +395,11 @@ def run_and_store_forecast(run_date: str, *, db_path: str | None = None, model_i
 
     # Delete existing predictions for the same date/model/horizon (idempotent)
     if cfg.get("type") == "postgresql":
-        # use schema-qualified name (other queries reference lf.*)
+        # use schema-qualified name
         schema = "lf"
         fq_table = f'"{schema}"."t_predicted_demand_chatbot"'
 
-        # Ensure the table exists (defensive — covers cases where table was dropped externally)
+        # Ensure the table exists (defensive)
         cur.execute(
             "SELECT 1 FROM information_schema.tables WHERE table_schema = %s AND table_name = %s",
             (schema, "t_predicted_demand_chatbot"),
@@ -440,8 +457,7 @@ def run_and_store_forecast(run_date: str, *, db_path: str | None = None, model_i
             conn.commit()
 
     else:
-        # sqlite path: use pandas.to_sql (sqlite3 connection supported)
-        # Use parameterized DELETE for sqlite as well
+        # sqlite path: use pandas.to_sql
         cur.execute(
             "DELETE FROM t_predicted_demand_chatbot WHERE prediction_date = ? AND model_id = ? AND horizon_type = ?",
             (str(run_date), model_id, horizon_type),
