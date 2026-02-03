@@ -1,4 +1,4 @@
-# tools.py - MERGED VERSION with improved graph functionality
+# tools.py - FULLY CORRECTED VERSION
 # ------------------------------------------------------
 # Database + Visualization Tools (PostgreSQL / SQLite)
 # ------------------------------------------------------
@@ -188,10 +188,10 @@ def execute_query(sql: str, limit: int | None = None) -> dict:
 # ------------------------------------------------------
 # SQL GENERATION (LLM) - IMPROVED FOR GRAPHS
 # ------------------------------------------------------
-
 def generate_sql(user_prompt: str) -> str:
     """
     IMPROVED: Generate database-specific SQL with better handling for graph queries.
+    STRICTLY ENFORCES date-range based filtering (NO strftime).
     """
     llm = get_agent_llm("nl_to_sql")
 
@@ -219,11 +219,71 @@ CRITICAL RULES:
 - DO NOT use SUM/AVG/COUNT unless explicitly asked for aggregation
 - For visualization queries, return RAW data: datetime, date, block, demand
 
+🔥 ABSOLUTE TIME FILTER RULE (NON-NEGOTIABLE):
+- NEVER use strftime(), extract(), month(), or year() for filtering
+- NEVER compare month numbers (e.g., BETWEEN 3 AND 5)
+- ALL time logic MUST use FULL DATE comparisons:
+  → date = 'YYYY-MM-DD'
+  → date IN ('YYYY-MM-DD', ...)
+  → date BETWEEN 'YYYY-MM-DD' AND 'YYYY-MM-DD'
+- If user mentions months/seasons (e.g., "March to May", "Summer"):
+  → Convert them into FULL DATE RANGES
+  → DO NOT extract month or year from date column
+
+METRICS QUERY RULES (MANDATORY):
+- If user asks for MAPE / RMSE for a specific date:
+  → Query ONLY t_metrics
+  → Filter ONLY by date
+  → DO NOT infer or derive model_id
+- NEVER use subqueries, joins, LIMIT, or date ranges for metrics
+- Use model_id ONLY if user explicitly asks for a specific model
+
 AVAILABLE DATA RANGES:
 - Actual demand: {ACTUAL_DATA_START.date()} → {ACTUAL_DATA_END.date()}
 - Forecasted demand: {FORECAST_DATA_START.date()} → {FORECAST_DATA_END.date()}
 - Holidays: {HOLIDAY_START} → {HOLIDAY_END}
 - Metrics: {METRICS_START} → {METRICS_END}
+
+TIME BLOCK MAPPING (1–96, each block = 15 minutes):
+- Block 1  = 00:00–00:15  (Midnight)
+- Block 24 = 05:45–06:00  (Pre-dawn)
+- Block 25 = 06:00–06:15  (Early morning start)
+- Block 37 = 09:00–09:15  (Morning peak start)
+- Block 48 = 11:45–12:00  (Midday)
+- Block 61 = 15:00–15:15  (Afternoon peak start)
+- Block 72 = 17:45–18:00  (Evening peak start)
+- Block 84 = 20:45–21:00  (Evening peak end)
+- Block 96 = 23:45–00:00  (End of day)
+
+NAMED BLOCK PERIODS:
+- Off-Peak / Night:      blocks 1–24   (00:00–06:00)
+- Morning Ramp:          blocks 25–36  (06:00–09:00)
+- Morning Peak:          blocks 37–48  (09:00–12:00)
+- Midday:                blocks 49–60  (12:00–15:00)
+- Afternoon Peak:        blocks 61–72  (15:00–18:00)
+- Evening Peak:          blocks 73–84  (18:00–21:00)
+- Night Ramp-down:       blocks 85–96  (21:00–00:00)
+
+SEASON DEFINITIONS (Indian calendar):
+- Winter:  Dec, Jan, Feb
+- Summer:  March, April, May
+- Monsoon: June, July, Aug, Sep
+- Post-Monsoon: Oct, Nov
+
+SEASON DETECTION IN SQL (STRICT – DATE RANGE ONLY):
+- Winter:
+  date BETWEEN 'YYYY-12-01' AND 'YYYY-02-28'
+- Summer:
+  date BETWEEN 'YYYY-03-01' AND 'YYYY-05-31'
+- Monsoon:
+  date BETWEEN 'YYYY-06-01' AND 'YYYY-09-30'
+- Post-Monsoon:
+  date BETWEEN 'YYYY-10-01' AND 'YYYY-11-30'
+
+⚠️ CRITICAL:
+- DO NOT use strftime(), CAST(strftime), EXTRACT, or month logic
+- DO NOT compare numeric months (e.g., BETWEEN 3 AND 5)
+- ALWAYS expand seasons/months into explicit date ranges
 
 TABLES & COLUMNS:
 1. {schema}t_actual_demand
@@ -239,7 +299,7 @@ TABLES & COLUMNS:
    - forecasted_demand (real number, MW)
    - model_id (text)
 
-3. {schema}t_predicted_demand_chatbot  # NEW TABLE
+3. {schema}t_predicted_demand_chatbot
    - datetime (timestamp)
    - prediction_date (date)
    - block (integer 1-96)
@@ -256,24 +316,18 @@ TABLES & COLUMNS:
 QUERY PATTERNS:
 
 **For Single Date Queries (Trend/Graph):**
-```sql
 SELECT datetime, date, block, demand 
 FROM {schema}t_actual_demand 
 WHERE date = '2025-05-15'
 ORDER BY datetime;
-```
 
 **For Multi-Date Comparison (e.g., "compare 15 august vs 16 august"):**
-IMPORTANT: NO GROUP BY, NO SUM - just raw data!
-```sql
 SELECT datetime, date, block, demand
 FROM {schema}t_actual_demand
 WHERE date IN ('2025-08-15', '2025-08-16')
 ORDER BY date, datetime;
-```
 
 **For Actual vs Forecast Comparison (Single Date):**
-```sql
 SELECT 
     a.datetime,
     a.date,
@@ -285,23 +339,23 @@ JOIN {schema}t_forecasted_demand f
     ON a.datetime = f.datetime
 WHERE a.date = '2025-05-15'
 ORDER BY a.datetime;
-```
 
 **For Date Range Queries:**
-```sql
 SELECT datetime, date, block, demand
 FROM {schema}t_actual_demand
-WHERE date >= '2025-05-01' AND date <= '2025-05-31'
+WHERE date BETWEEN '2025-05-01' AND '2025-05-31'
 ORDER BY datetime;
-```
 
 **For Statistics/Aggregation (ONLY when explicitly asked):**
-```sql
 SELECT date, AVG(demand) as avg_demand, MAX(demand) as max_demand
 FROM {schema}t_actual_demand
 WHERE date IN ('2025-08-15', '2025-08-16')
 GROUP BY date;
-```
+
+**For Metrics Queries (Single Date):**
+SELECT mape, rmse
+FROM {schema}t_metrics
+WHERE date = '2025-10-17';
 
 IMPORTANT RULES:
 1. For multi-date comparisons, use WHERE date IN (...) NOT JOIN
@@ -327,6 +381,7 @@ Current logical date: {LOGICAL_NOW_DATE}
     print(f"[SQL_GEN] Raw LLM output: {response[:200]}...")
     
     return response
+
 
 
 def strip_markdown(sql: str) -> str:
@@ -436,12 +491,18 @@ def clamp_dates_to_availability(sql: str) -> str:
 
 def generate_plot_code_improved(sql: str, data: list, user_query: str) -> str:
     """
-    IMPROVED: Generate HIGH-QUALITY matplotlib code based on data structure.
+    CORRECTED: Generate HIGH-QUALITY matplotlib code based on data structure.
     Uses smart detection to create the best visualization.
     """
     
     if not data:
         raise ValueError("No data to plot")
+    
+    if not isinstance(data, list) or len(data) == 0:
+        raise ValueError("Data must be a non-empty list")
+    
+    if not isinstance(data[0], dict):
+        raise ValueError("Data rows must be dictionaries")
     
     columns = list(data[0].keys())
     sample_row = data[0]
@@ -484,23 +545,42 @@ def generate_plot_code_improved(sql: str, data: list, user_query: str) -> str:
 
 def _detect_multi_date_comparison(data: list, user_query: str) -> bool:
     """
-    Detect if this is a multi-date comparison query.
+    CORRECTED: Detect if this is a multi-date comparison query.
     E.g., "compare 15 august vs 16 august", "15 and 16 august demand"
     """
+    if not data or len(data) == 0:
+        return False
+    
+    if not isinstance(data[0], dict):
+        return False
+    
     comparison_keywords = ['compare', 'vs', 'versus', 'between', 'and']
     query_lower = user_query.lower()
     
     has_comparison_keyword = any(kw in query_lower for kw in comparison_keywords)
     
-    if 'date' in data[0]:
-        unique_dates = set(str(row['date']) for row in data)
+    # Check if 'date' column exists
+    if 'date' not in data[0]:
+        return False
+    
+    # Count unique dates
+    try:
+        unique_dates = set()
+        for row in data:
+            if not isinstance(row, dict):
+                continue
+            date_val = row.get('date')
+            if date_val is not None:
+                unique_dates.add(str(date_val))
+        
         has_multiple_dates = len(unique_dates) > 1
-    else:
-        has_multiple_dates = False
+    except Exception as e:
+        print(f"[MULTI_DATE_DETECT] Error counting dates: {e}")
+        return False
     
     columns = list(data[0].keys())
     has_date_col = 'date' in columns
-    has_demand_col = any(col in columns for col in ['demand', 'actual_demand', 'forecasted_demand'])
+    has_demand_col = any(col in columns for col in ['demand', 'actual_demand', 'forecasted_demand', 'predicted_demand'])
     
     result = has_comparison_keyword and has_multiple_dates and has_date_col and has_demand_col
     
@@ -511,12 +591,12 @@ def _detect_multi_date_comparison(data: list, user_query: str) -> bool:
 
 def _generate_multi_date_comparison_plot(columns: list, data: list, user_query: str) -> str:
     """
-    IMPROVED: Generate side-by-side comparison for multiple dates.
+    CORRECTED: Generate side-by-side comparison for multiple dates.
     FULLY DYNAMIC - works with any value column.
     """
     
     # Dynamically find the value column
-    exclude_cols = ['datetime', 'date', 'block', 'name', 'entrydatetime', 'model_id']
+    exclude_cols = ['datetime', 'date', 'block', 'name', 'entrydatetime', 'model_id', 'generated_at', 'prediction_date']
     value_columns = [col for col in columns if col not in exclude_cols]
     
     if not value_columns:
@@ -542,14 +622,22 @@ fig, ax = plt.subplots(figsize=(16, 8))
 data_by_date = defaultdict(lambda: {{'x': [], 'y': []}})
 
 for row in data:
-    date_str = str(row['date'])
+    if not isinstance(row, dict):
+        continue
+    
+    date_str = str(row.get('date', ''))
+    if not date_str:
+        continue
     
     # Try to extract time index (block or datetime)
-    if 'block' in row:
-        x_value = int(row['block'])
-    elif 'datetime' in row:
+    if 'block' in row and row['block'] is not None:
         try:
-            dt = datetime.fromisoformat(str(row['datetime']))
+            x_value = int(row['block'])
+        except (ValueError, TypeError):
+            x_value = len(data_by_date[date_str]['x'])
+    elif 'datetime' in row and row['datetime'] is not None:
+        try:
+            dt = datetime.fromisoformat(str(row['datetime']).replace('Z', '+00:00'))
             x_value = dt.hour * 4 + dt.minute // 15  # Convert to block (0-95)
         except:
             x_value = len(data_by_date[date_str]['x'])
@@ -557,21 +645,27 @@ for row in data:
         x_value = len(data_by_date[date_str]['x'])
     
     # Get value dynamically
+    y_value = None
     try:
         y_value = float(row['{value_col}'])
     except (KeyError, ValueError, TypeError):
-        for col_name in ['demand', 'actual_demand', 'forecasted_demand', 'value']:
-            if col_name in row:
-                y_value = float(row[col_name])
-                break
-        else:
-            y_value = 0
+        for col_name in ['demand', 'actual_demand', 'forecasted_demand', 'predicted_demand', 'value']:
+            if col_name in row and row[col_name] is not None:
+                try:
+                    y_value = float(row[col_name])
+                    break
+                except (ValueError, TypeError):
+                    continue
     
-    data_by_date[date_str]['x'].append(x_value)
-    data_by_date[date_str]['y'].append(y_value)
+    if y_value is not None:
+        data_by_date[date_str]['x'].append(x_value)
+        data_by_date[date_str]['y'].append(y_value)
 
 # Sort dates for consistent ordering
 sorted_dates = sorted(list(data_by_date.keys()))
+
+if not sorted_dates:
+    raise ValueError("No valid data to plot")
 
 # Define colors for different dates
 colors = ['#2E86AB', '#F18F01', '#06A77D', '#A23B72', '#D00000', '#7209B7']
@@ -582,8 +676,11 @@ for idx, date_str in enumerate(sorted_dates):
     x_vals = data_by_date[date_str]['x']
     y_vals = data_by_date[date_str]['y']
     
+    if not x_vals or not y_vals:
+        continue
+    
     if {use_bars}:
-        width = 0.8 / len(sorted_dates)
+        width = 0.8 / len(sorted_dates) if len(sorted_dates) > 0 else 0.8
         offset = (idx - len(sorted_dates)/2 + 0.5) * width
         positions = [x + offset for x in x_vals]
         
@@ -622,9 +719,9 @@ plt.close()
 
 
 def _generate_timeseries_plot(columns: list, row_count: int, has_datetime: bool) -> str:
-    """IMPROVED: Generate time-series line plot - FULLY DYNAMIC"""
+    """CORRECTED: Generate time-series line plot - FULLY DYNAMIC"""
     
-    exclude_cols = ['datetime', 'date', 'block', 'name', 'entrydatetime', 'model_id']
+    exclude_cols = ['datetime', 'date', 'block', 'name', 'entrydatetime', 'model_id', 'generated_at', 'prediction_date']
     value_columns = [col for col in columns if col not in exclude_cols]
     
     if not value_columns:
@@ -645,15 +742,39 @@ from datetime import datetime
 
 fig, ax = plt.subplots(figsize=(14, 7))
 
-# Extract data
-try:
-    x_values = [datetime.fromisoformat(str(row['{time_col}'])) for row in data]
-    use_dates = True
-except:
-    x_values = list(range(len(data)))
-    use_dates = False
+# Extract data with error handling
+x_values = []
+y_values = []
+use_dates = True
 
-y_values = [float(row['{value_col}']) for row in data]
+for row in data:
+    if not isinstance(row, dict):
+        continue
+    
+    # Extract x value (time)
+    time_val = row.get('{time_col}')
+    if time_val is None:
+        continue
+    
+    try:
+        dt = datetime.fromisoformat(str(time_val).replace('Z', '+00:00'))
+        x_values.append(dt)
+    except:
+        use_dates = False
+        x_values.append(len(x_values))
+    
+    # Extract y value (demand)
+    demand_val = row.get('{value_col}')
+    if demand_val is None:
+        y_values.append(0)
+    else:
+        try:
+            y_values.append(float(demand_val))
+        except (ValueError, TypeError):
+            y_values.append(0)
+
+if not x_values or not y_values:
+    raise ValueError("No valid data to plot")
 
 # Create plot - LINE with POINTS
 if use_dates:
@@ -715,9 +836,9 @@ plt.close()
 
 
 def _generate_comparison_plot(columns: list, row_count: int) -> str:
-    """IMPROVED: Generate comparison plot - FULLY DYNAMIC"""
+    """CORRECTED: Generate comparison plot - FULLY DYNAMIC"""
     
-    exclude_cols = ['datetime', 'date', 'block', 'name', 'entrydatetime', 'model_id']
+    exclude_cols = ['datetime', 'date', 'block', 'name', 'entrydatetime', 'model_id', 'generated_at', 'prediction_date']
     value_columns = [col for col in columns if col not in exclude_cols]
     
     if len(value_columns) < 2:
@@ -731,12 +852,12 @@ def _generate_comparison_plot(columns: list, row_count: int) -> str:
     # Determine colors based on column names
     if 'actual' in col1.lower():
         color1, label1 = '#2E86AB', col1.replace('_', ' ').title()
-    elif 'forecast' in col1.lower():
+    elif 'forecast' in col1.lower() or 'predict' in col1.lower():
         color1, label1 = '#F18F01', col1.replace('_', ' ').title()
     else:
         color1, label1 = '#2E86AB', col1.replace('_', ' ').title()
     
-    if 'forecast' in col2.lower():
+    if 'forecast' in col2.lower() or 'predict' in col2.lower():
         color2, label2 = '#F18F01', col2.replace('_', ' ').title()
     elif 'actual' in col2.lower():
         color2, label2 = '#2E86AB', col2.replace('_', ' ').title()
@@ -752,16 +873,44 @@ from datetime import datetime
 
 fig, ax = plt.subplots(figsize=(14, 7))
 
-# Extract data
-try:
-    x_values = [datetime.fromisoformat(str(row['{time_col}'])) for row in data]
-    use_dates = True
-except:
-    x_values = list(range(len(data)))
-    use_dates = False
+# Extract data with error handling
+x_values = []
+values1 = []
+values2 = []
+use_dates = True
 
-values1 = [float(row['{col1}']) for row in data]
-values2 = [float(row['{col2}']) for row in data]
+for row in data:
+    if not isinstance(row, dict):
+        continue
+    
+    # Extract x value
+    time_val = row.get('{time_col}')
+    if time_val is None:
+        continue
+    
+    try:
+        dt = datetime.fromisoformat(str(time_val).replace('Z', '+00:00'))
+        x_values.append(dt)
+    except:
+        use_dates = False
+        x_values.append(len(x_values))
+    
+    # Extract y values
+    val1 = row.get('{col1}')
+    val2 = row.get('{col2}')
+    
+    try:
+        values1.append(float(val1) if val1 is not None else 0)
+    except (ValueError, TypeError):
+        values1.append(0)
+    
+    try:
+        values2.append(float(val2) if val2 is not None else 0)
+    except (ValueError, TypeError):
+        values2.append(0)
+
+if not x_values or not values1 or not values2:
+    raise ValueError("No valid data to plot")
 
 # Plot both lines with points
 ax.plot(x_values, values1,
@@ -813,21 +962,43 @@ plt.close()
 
 
 def _generate_block_plot(columns: list, row_count: int) -> str:
-    """Generate block-wise bar chart"""
+    """CORRECTED: Generate block-wise bar chart"""
     
-    value_col = None
-    for col in columns:
-        if col not in ['block', 'date', 'datetime']:
-            value_col = col
-            break
+    exclude_cols = ['block', 'date', 'datetime', 'name', 'entrydatetime', 'model_id', 'generated_at', 'prediction_date']
+    value_columns = [col for col in columns if col not in exclude_cols]
+    
+    if not value_columns:
+        raise ValueError(f"Cannot find value column in: {columns}")
+    
+    value_col = value_columns[0]
     
     return f"""
 import matplotlib.pyplot as plt
 
 fig, ax = plt.subplots(figsize=(12, 7))
 
-blocks = [int(row['block']) for row in data]
-values = [float(row['{value_col}']) for row in data]
+# Extract data with error handling
+blocks = []
+values = []
+
+for row in data:
+    if not isinstance(row, dict):
+        continue
+    
+    block_val = row.get('block')
+    demand_val = row.get('{value_col}')
+    
+    if block_val is None or demand_val is None:
+        continue
+    
+    try:
+        blocks.append(int(block_val))
+        values.append(float(demand_val))
+    except (ValueError, TypeError):
+        continue
+
+if not blocks or not values:
+    raise ValueError("No valid data to plot")
 
 # Bar chart
 bars = ax.bar(blocks, values, 
@@ -837,9 +1008,12 @@ bars = ax.bar(blocks, values,
               linewidth=1.5)
 
 # Color gradient
-colors = plt.cm.viridis([v/max(values) for v in values])
-for bar, color in zip(bars, colors):
-    bar.set_color(color)
+if values:
+    max_val = max(values)
+    if max_val > 0:
+        colors = plt.cm.viridis([v/max_val for v in values])
+        for bar, color in zip(bars, colors):
+            bar.set_color(color)
 
 ax.set_title('{value_col.replace("_", " ").title()} by Block', 
              fontsize=16, fontweight='bold', pad=20)
@@ -855,7 +1029,10 @@ plt.close()
 
 
 def _generate_generic_plot(columns: list, row_count: int) -> str:
-    """Fallback generic plot"""
+    """CORRECTED: Fallback generic plot"""
+    
+    if len(columns) == 0:
+        raise ValueError("No columns in data")
     
     x_col = columns[0]
     y_col = columns[1] if len(columns) > 1 else columns[0]
@@ -865,8 +1042,22 @@ import matplotlib.pyplot as plt
 
 fig, ax = plt.subplots(figsize=(12, 7))
 
-x_values = list(range(len(data)))
-y_values = [float(row['{y_col}']) for row in data]
+# Extract data
+y_values = []
+for row in data:
+    if not isinstance(row, dict):
+        continue
+    
+    val = row.get('{y_col}')
+    try:
+        y_values.append(float(val) if val is not None else 0)
+    except (ValueError, TypeError):
+        y_values.append(0)
+
+if not y_values:
+    raise ValueError("No valid data to plot")
+
+x_values = list(range(len(y_values)))
 
 ax.plot(x_values, y_values,
         linewidth=2.5,
@@ -889,13 +1080,13 @@ plt.close()
 
 
 # ------------------------------------------------------
-# MAIN NL → SQL TOOL - IMPROVED
+# MAIN NL → SQL TOOL
 # ------------------------------------------------------
 
 @tool
 def nl_to_sql_db_tool(user_request: str) -> dict:
     """
-    IMPROVED: Convert natural language to SQL and execute it.
+    CORRECTED: Convert natural language to SQL and execute it.
     Returns data ready for visualization.
     """
     try:
@@ -949,18 +1140,25 @@ def nl_to_sql_db_tool(user_request: str) -> dict:
 
 
 # ------------------------------------------------------
-# GRAPH PLOTTING TOOL - DRAMATICALLY IMPROVED
+# GRAPH PLOTTING TOOL - FULLY CORRECTED
 # ------------------------------------------------------
 @tool  
 def graph_plotting_tool(sql: str, user_query: str = "") -> dict:
     """
-    IMPROVED: Execute SQL, fetch data, and generate high-quality visualization.
+    CORRECTED: Execute SQL, fetch data, and generate high-quality visualization.
     ALWAYS queries the database fresh.
     """
     try:
         print(f"[GRAPH] Starting visualization pipeline...")
         print(f"[GRAPH] SQL: {sql[:150]}...")
         print(f"[GRAPH] User query: {user_query[:100]}...")
+        
+        # Validate inputs
+        if not sql or not isinstance(sql, str):
+            return {
+                "ok": False,
+                "error": "Invalid SQL query provided",
+            }
         
         # Execute query
         sql = adapt_sql_for_db(sql)
@@ -975,7 +1173,7 @@ def graph_plotting_tool(sql: str, user_query: str = "") -> dict:
             }
 
         data = result["rows"]
-        if not data:
+        if not data or len(data) == 0:
             print(f"[GRAPH] No data returned")
             return {
                 "ok": False,
@@ -985,7 +1183,15 @@ def graph_plotting_tool(sql: str, user_query: str = "") -> dict:
 
         print(f"[GRAPH] Retrieved {len(data)} rows")
         
-        # IMPROVED: Generate plot code with user_query context
+        # Validate data structure
+        if not isinstance(data, list) or not isinstance(data[0], dict):
+            return {
+                "ok": False,
+                "error": "Invalid data structure returned from database",
+                "sql": sql,
+            }
+        
+        # Generate plot code with user_query context
         plot_code = generate_plot_code_improved(sql, data, user_query)
         print(f"[GRAPH] Generated plot code ({len(plot_code)} chars)")
         
@@ -1008,11 +1214,13 @@ def graph_plotting_tool(sql: str, user_query: str = "") -> dict:
                 "max": max,
                 "sorted": sorted,
                 "set": set,
+                "isinstance": isinstance,
             },
             "plt": plt,
             "mdates": mdates,
             "datetime": datetime,
             "defaultdict": defaultdict,
+            "ValueError": ValueError,
         }
         
         exec_locals = {
@@ -1027,6 +1235,13 @@ def graph_plotting_tool(sql: str, user_query: str = "") -> dict:
         # Save plot
         buffer.seek(0)
         image_data = buffer.read()
+        
+        if len(image_data) == 0:
+            return {
+                "ok": False,
+                "error": "Plot generation produced empty image",
+                "sql": sql,
+            }
         
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"data_visualization_{timestamp}.png"

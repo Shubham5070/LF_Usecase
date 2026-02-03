@@ -16,7 +16,7 @@ DB_PATH = Path("data/load_forecasting.db")
 RUN_DATE = "2026-01-15"
 MODEL_ID = 202
 HORIZON_TYPE = "day_ahead"
-MODEL_PATH = "amazon/chronos-t5-large"
+MODEL_PATH = "amazon/chronos-t5-small"
 
 FREQ = "15min"
 BLOCKS_PER_DAY = 96
@@ -334,9 +334,10 @@ def run_and_store_forecast(run_date: str, *, db_path: str | None = None, model_i
 
     pipeline = ChronosPipeline.from_pretrained(
         model_path,
-        device_map=device,
-        dtype=torch.bfloat16
+        device_map="cpu",
+        torch_dtype=torch.float32   # CPU-friendly
     )
+
 
     # Prepare data
     df_train_raw = prepare_train_data(conn, run_date, lby=LBY, lbm=LBM, hrs_end=5)
@@ -353,10 +354,10 @@ def run_and_store_forecast(run_date: str, *, db_path: str | None = None, model_i
         forecast = pipeline.predict(
             context,
             prediction_length=BLOCKS_PER_DAY,
-            num_samples=20
+            num_samples=5        # ↓ big speedup
         )
 
-    predictions = forecast[0].numpy()[10, :]
+    predictions = forecast[0].median(dim=0).values.numpy()
 
     # Create forecast timestamps
     forecast_index = pd.date_range(

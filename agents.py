@@ -122,6 +122,9 @@ def stage_print(stage: str, msg: str, *, llm=None, model_name: str | None = None
 # -------------------------
 # QUERY ANALYSIS AGENT (Entry Point)
 # -------------------------
+
+
+
 def query_analysis_agent(state: GraphState) -> GraphState:
     """
     Analyzes user query and determines routing using hybrid approach.
@@ -137,8 +140,7 @@ def query_analysis_agent(state: GraphState) -> GraphState:
     import re
    
     query = state.user_query.lower().strip()
-    # Fixed current date
-    current_date = datetime.strptime("2026-01-15", "%Y-%m-%d")
+    current_date = datetime.now()
     current_date_str = current_date.strftime("%Y-%m-%d")
     current_date_readable = current_date.strftime("%B %d, %Y")
    
@@ -150,17 +152,19 @@ def query_analysis_agent(state: GraphState) -> GraphState:
    
     if rule_result["confident"]:
         # Rule-based classification is confident
-        stage_print("QUERY_ANALYSIS", f"✅ RULE-BASED classification (confidence: {rule_result['confidence_reason']})", model_name=get_agent_model_name("query_analysis"))
+        print(f"[QUERY_ANALYSIS] ✅ RULE-BASED classification (confidence: {rule_result['confidence_reason']})")
         state.intent = rule_result["intent"]
         state.need_db_call = rule_result["need_db_call"]
         state.need_graph = rule_result["need_graph"]
         state.need_model_run = rule_result["need_model_run"]
         state.need_api_call = rule_result["need_api_call"]
        
-        stage_print(
-            "QUERY_ANALYSIS",
-            f"Result → intent={state.intent}, need_db_call={state.need_db_call}, need_graph={state.need_graph}, need_model_run={state.need_model_run}, need_api_call={state.need_api_call}",
-            model_name=get_agent_model_name("query_analysis")
+        print(
+            f"[QUERY_ANALYSIS] Result → intent={state.intent}, "
+            f"need_db_call={state.need_db_call}, "
+            f"need_graph={state.need_graph}, "
+            f"need_model_run={state.need_model_run}, "
+            f"need_api_call={state.need_api_call}"
         )
         return state
    
@@ -168,7 +172,7 @@ def query_analysis_agent(state: GraphState) -> GraphState:
     # PHASE 2: LLM-BASED CLASSIFICATION (for ambiguous cases)
     # ═══════════════════════════════════════════════════════════
    
-    stage_print(f"QUERY_ANALYSIS", f"🤖 LLM-BASED classification (reason: {rule_result['confidence_reason']})", model_name=get_agent_model_name("query_analysis"))
+    print(f"[QUERY_ANALYSIS] 🤖 LLM-BASED classification (reason: {rule_result['confidence_reason']})")
    
     llm = get_agent_llm("query_analysis")
    
@@ -190,7 +194,7 @@ DATABASE SCHEMA:
 ROUTING RULES:
  
 1. GRAPH CHECK:
-   - Keywords: plot, show, graph, chart, visualize, visual, display, trend, comparison, vs, versus
+   - Keywords: plot, show, graph, chart, visualize, visual, display
    - If graph → need_graph: true, need_db_call: true
    
 2. DATE/TIME BASED ROUTING:
@@ -207,7 +211,7 @@ INTENT CLASSIFICATION:
  
 TOOL REQUIREMENTS:
 - need_db_call: true for data/forecast/decision, false for text
-- need_graph: true ONLY if explicitly requested (plot, chart, visualize, show trend, comparison)
+- need_graph: true ONLY if explicitly requested
 - need_model_run: true ONLY for "forecast" intent
 - need_api_call: true if external data needed
  
@@ -229,12 +233,12 @@ OUTPUT FORMAT: Return ONLY valid JSON, no other text.
         )
     ).content
    
-    stage_print(f"QUERY_ANALYSIS", f"Raw LLM response (length={len(response)}): {repr(response[:300])}", model_name=get_agent_model_name("query_analysis"))
+    print(f"[QUERY_ANALYSIS] Raw LLM response (length={len(response)}): {repr(response[:300])}")
    
     # Parse LLM response
     try:
         response_cleaned = _extract_json_from_response(response)
-        stage_print(f"QUERY_ANALYSIS", f"Cleaned response: {repr(response_cleaned[:200])}", model_name=get_agent_model_name("query_analysis"))
+        print(f"[QUERY_ANALYSIS] Cleaned response: {repr(response_cleaned[:200])}")
        
         result = json.loads(response_cleaned)
        
@@ -256,8 +260,8 @@ OUTPUT FORMAT: Return ONLY valid JSON, no other text.
         print("[QUERY_ANALYSIS] ✅ Successfully parsed LLM response")
        
     except Exception as e:
-        stage_print("QUERY_ANALYSIS", f"❌ LLM parsing failed: {e}", model_name=get_agent_model_name("query_analysis"))
-        stage_print("QUERY_ANALYSIS", "Falling back to rule-based result", model_name=get_agent_model_name("query_analysis"))
+        print(f"[QUERY_ANALYSIS] ❌ LLM parsing failed: {e}")
+        print(f"[QUERY_ANALYSIS] Falling back to rule-based result")
        
         # Use rule-based result as fallback even if not confident
         state.intent = rule_result["intent"]
@@ -266,10 +270,12 @@ OUTPUT FORMAT: Return ONLY valid JSON, no other text.
         state.need_model_run = rule_result["need_model_run"]
         state.need_api_call = rule_result["need_api_call"]
    
-    stage_print(
-        "QUERY_ANALYSIS",
-        f"Result → intent={state.intent}, need_db_call={state.need_db_call}, need_graph={state.need_graph}, need_model_run={state.need_model_run}, need_api_call={state.need_api_call}",
-        model_name=get_agent_model_name("query_analysis")
+    print(
+        f"[QUERY_ANALYSIS] Result → intent={state.intent}, "
+        f"need_db_call={state.need_db_call}, "
+        f"need_graph={state.need_graph}, "
+        f"need_model_run={state.need_model_run}, "
+        f"need_api_call={state.need_api_call}"
     )
     return state
  
@@ -295,13 +301,65 @@ def _apply_rule_based_classification(query: str, current_date: datetime) -> dict
     # ═══════════════════════════════════════════════════════════
     # RULE 1: CHECK FOR GRAPH/VISUALIZATION REQUEST
     # ═══════════════════════════════════════════════════════════
-    graph_keywords = r'\b(plot|graph|chart|visuali[sz]e|show.*trend|display.*graph|draw|comparison|compare|vs|versus)\b'
+    graph_keywords = r'\b(plot|graph|chart|visuali[sz]e|show.*trend|display.*graph|draw)\b'
     if re.search(graph_keywords, query):
         result["need_graph"] = True
         result["need_db_call"] = True
    
     # ═══════════════════════════════════════════════════════════
-    # RULE 2: GENERAL/DEFINITION QUERIES (HIGH CONFIDENCE)
+    # RULE 2: METRIC QUERIES (HIGH PRIORITY - BEFORE GENERAL QUERIES)
+    # ═══════════════════════════════════════════════════════════
+    metric_keywords = r'\b(ape|mape|rmse|mae|mse|r2|accuracy|error|metric|performance|score)\b'
+    if re.search(metric_keywords, query):
+        result["intent"] = "data"
+        result["need_db_call"] = True
+        result["confident"] = True
+        result["confidence_reason"] = "Metric/performance query detected"
+   
+    # ═══════════════════════════════════════════════════════════
+    # RULE 3: DATE EXTRACTION AND TIME-BASED ROUTING (MULTI-LIBRARY)
+    # ═══════════════════════════════════════════════════════════
+    date_info = _extract_date_from_query_multi(query, current_date)
+   
+    if date_info and date_info['date']:
+        extracted_date = date_info['date']
+        is_future = extracted_date > current_date
+       
+        # Format both dates in same format
+        current_date_formatted = current_date.strftime("%Y-%m-%d")
+        extracted_date_formatted = extracted_date.strftime("%Y-%m-%d")
+       
+        # Print detailed comparison
+        print(f"\n{'='*60}")
+        print(f"[DATE_COMPARISON] Current Date:    {current_date_formatted}")
+        print(f"[DATE_COMPARISON] Extracted Date:  {extracted_date_formatted}")
+        print(f"[DATE_COMPARISON] Extracted By:    {date_info['library']}")
+        print(f"[DATE_COMPARISON] Original Format: {date_info['original_format']}")
+        print(f"[DATE_COMPARISON] Consensus:       {date_info['consensus']}")
+        print(f"[DATE_COMPARISON] Is Future?       {is_future}")
+        print(f"{'='*60}\n")
+       
+        if is_future:
+            result["intent"] = "forecast"
+            result["need_db_call"] = True
+            result["need_model_run"] = True
+            result["confident"] = True
+            result["confidence_reason"] = f"Future date: {extracted_date_formatted} (by {date_info['library']})"
+        else:
+            result["intent"] = "data"
+            result["need_db_call"] = True
+            result["need_model_run"] = False
+            result["confident"] = True
+            result["confidence_reason"] = f"Past date: {extracted_date_formatted} (by {date_info['library']})"
+       
+        return result
+   
+    # If we detected metrics but no specific date, still return as data query
+    if result["intent"] == "data" and result["confident"]:
+        return result
+   
+    # ═══════════════════════════════════════════════════════════
+    # RULE 4: GENERAL/DEFINITION QUERIES
     # ═══════════════════════════════════════════════════════════
     general_patterns = [
         r'^\s*what\s+is\s+',
@@ -313,39 +371,15 @@ def _apply_rule_based_classification(query: str, current_date: datetime) -> dict
    
     for pattern in general_patterns:
         if re.search(pattern, query):
-            # Check if it's NOT asking about specific data
-            if not re.search(r'\b(demand|forecast|actual|predict|data|value|number)\b', query):
+            # Check if it's NOT asking about specific data/metrics
+            if not re.search(r'\b(demand|forecast|actual|predict|data|value|number|ape|mape|rmse|mae|metric|error|accuracy|holiday|performance)\b', query):
                 result["intent"] = "text"
                 result["confident"] = True
                 result["confidence_reason"] = "General information query"
                 return result
    
     # ═══════════════════════════════════════════════════════════
-    # RULE 3: DATE EXTRACTION AND TIME-BASED ROUTING
-    # ═══════════════════════════════════════════════════════════
-    extracted_date = _extract_date_from_query(query, current_date)
-   
-    if extracted_date:
-        is_future = extracted_date > current_date
-       
-        # Clear time-based classification
-        if is_future:
-            result["intent"] = "forecast"
-            result["need_db_call"] = True
-            result["need_model_run"] = True
-            result["confident"] = True
-            result["confidence_reason"] = f"Future date detected: {extracted_date.strftime('%Y-%m-%d')}"
-        else:
-            result["intent"] = "data"
-            result["need_db_call"] = True
-            result["need_model_run"] = False
-            result["confident"] = True
-            result["confidence_reason"] = f"Past date detected: {extracted_date.strftime('%Y-%m-%d')}"
-       
-        return result
-   
-    # ═══════════════════════════════════════════════════════════
-    # RULE 4: RELATIVE TIME KEYWORDS
+    # RULE 5: RELATIVE TIME KEYWORDS
     # ═══════════════════════════════════════════════════════════
    
     # PAST indicators
@@ -369,7 +403,7 @@ def _apply_rule_based_classification(query: str, current_date: datetime) -> dict
         return result
    
     # ═══════════════════════════════════════════════════════════
-    # RULE 5: BUSINESS INTELLIGENCE QUERIES
+    # RULE 6: BUSINESS INTELLIGENCE QUERIES
     # ═══════════════════════════════════════════════════════════
     decision_keywords = r'\b(compare|comparison|recommend|suggest|should|optimize|strategy|best|worst|what.if|versus|vs\.?)\b'
     if re.search(decision_keywords, query):
@@ -380,7 +414,7 @@ def _apply_rule_based_classification(query: str, current_date: datetime) -> dict
         return result
    
     # ═══════════════════════════════════════════════════════════
-    # RULE 6: DATA QUERIES (MEDIUM CONFIDENCE)
+    # RULE 7: DATA QUERIES (MEDIUM CONFIDENCE)
     # ═══════════════════════════════════════════════════════════
     data_keywords = r'\b(actual|real|historical|recorded|measured|holiday|metric|performance)\b'
     if re.search(data_keywords, query):
@@ -399,43 +433,275 @@ def _apply_rule_based_classification(query: str, current_date: datetime) -> dict
     return result
  
  
-def _extract_date_from_query(query: str, current_date: datetime) -> datetime:
+# ═══════════════════════════════════════════════════════════
+# MULTI-LIBRARY DATE EXTRACTION (WITHOUT DUCKLING)
+# ═══════════════════════════════════════════════════════════
+ 
+def _extract_date_from_query_multi(query: str, current_date: datetime) -> dict:
     """
-    Extract date from query string.
-    Returns datetime object if found, None otherwise.
+    Extract date using 3 libraries with consensus voting.
+    Uses: dateparser, dateutil, parsedatetime
+   
+    Returns:
+        dict with date, library name, original format, and consensus info
+        or None if no date found
+    """
+    from datetime import timedelta
+    from collections import Counter
+    import re
+   
+    print(f"[DATE_EXTRACT] Analyzing query: '{query}'")
+   
+    dates_found = []
+   
+    # ═══════════════════════════════════════════════════════════
+    # METHOD 1: dateparser (most comprehensive)
+    # ═══════════════════════════════════════════════════════════
+    try:
+        import dateparser
+       
+        settings = {
+            'RELATIVE_BASE': current_date,
+            'PREFER_DATES_FROM': 'future',
+            'RETURN_AS_TIMEZONE_AWARE': False,
+        }
+       
+        parsed = dateparser.parse(query, settings=settings)
+        if parsed:
+            dates_found.append({
+                'library': 'dateparser',
+                'date': parsed,
+                'confidence': 'high'
+            })
+            print(f"[DATE_EXTRACT] ✓ dateparser    → {parsed.strftime('%Y-%m-%d')}")
+    except Exception as e:
+        print(f"[DATE_EXTRACT] ✗ dateparser    → Failed: {e}")
+   
+    # ═══════════════════════════════════════════════════════════
+    # METHOD 2: dateutil (robust parsing)
+    # ═══════════════════════════════════════════════════════════
+    try:
+        from dateutil import parser as dateutil_parser
+       
+        # Extract potential date strings
+        date_candidates = re.findall(
+            r'\b\d{1,4}[-/]\d{1,2}[-/]\d{1,4}\b|'
+            r'\b(?:tomorrow|yesterday|today)\b|'
+            r'\b(?:next|last)\s+(?:week|month|year)\b|'
+            r'\b\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{4}\b',
+            query,
+            re.IGNORECASE
+        )
+       
+        for candidate in date_candidates:
+            try:
+                parsed = dateutil_parser.parse(candidate, default=current_date, fuzzy=True)
+                dates_found.append({
+                    'library': 'dateutil',
+                    'date': parsed,
+                    'confidence': 'medium',
+                    'matched_text': candidate
+                })
+                print(f"[DATE_EXTRACT] ✓ dateutil     → {parsed.strftime('%Y-%m-%d')} (from '{candidate}')")
+                break
+            except:
+                continue
+               
+        if not any(d['library'] == 'dateutil' for d in dates_found):
+            print(f"[DATE_EXTRACT] ✗ dateutil     → No valid date found")
+           
+    except Exception as e:
+        print(f"[DATE_EXTRACT] ✗ dateutil     → Failed: {e}")
+   
+    # ═══════════════════════════════════════════════════════════
+    # METHOD 3: parsedatetime (natural language)
+    # ═══════════════════════════════════════════════════════════
+    try:
+        import parsedatetime as pdt
+       
+        cal = pdt.Calendar()
+        time_struct, parse_status = cal.parse(query, sourceTime=current_date.timetuple())
+       
+        # parse_status: 1 = date, 2 = time, 3 = datetime
+        if parse_status in [1, 3]:
+            parsed = datetime(*time_struct[:6])
+            dates_found.append({
+                'library': 'parsedatetime',
+                'date': parsed,
+                'confidence': 'medium'
+            })
+            print(f"[DATE_EXTRACT] ✓ parsedatetime → {parsed.strftime('%Y-%m-%d')}")
+        else:
+            print(f"[DATE_EXTRACT] ✗ parsedatetime → No valid date found (status: {parse_status})")
+           
+    except Exception as e:
+        print(f"[DATE_EXTRACT] ✗ parsedatetime → Failed: {e}")
+   
+    # ═══════════════════════════════════════════════════════════
+    # CONSENSUS VOTING
+    # ═══════════════════════════════════════════════════════════
+   
+    if not dates_found:
+        print("[DATE_EXTRACT] ❌ No dates found by any library, trying regex fallback...")
+        regex_date = _extract_date_from_query_regex(query, current_date)
+        if regex_date:
+            return {
+                'date': regex_date,
+                'library': 'regex',
+                'original_format': 'pattern-matched',
+                'consensus': '1/1 (regex only)'
+            }
+        return None
+   
+    # Normalize dates to date-only (ignore time)
+    normalized_dates = []
+    for entry in dates_found:
+        date_only = entry['date'].date()
+        normalized_dates.append({
+            'date': date_only,
+            'library': entry['library'],
+            'confidence': entry['confidence'],
+            'matched_text': entry.get('matched_text', '')
+        })
+   
+    # Count occurrences
+    date_counter = Counter([entry['date'] for entry in normalized_dates])
+    most_common_date, count = date_counter.most_common(1)[0]
+   
+    total_parsers = len(dates_found)
+    consensus_ratio = count / total_parsers
+   
+    print(f"\n[DATE_EXTRACT] Consensus Analysis:")
+    print(f"  - Most common date: {most_common_date}")
+    print(f"  - Agreement: {count}/{total_parsers} parsers ({consensus_ratio*100:.0f}%)")
+   
+    # Find which library provided the consensus date
+    winning_entry = next(e for e in normalized_dates if e['date'] == most_common_date)
+   
+    # Determine original format from query
+    original_format = _detect_date_format(query, most_common_date)
+   
+    # Require at least 50% consensus
+    if consensus_ratio >= 0.5:
+        result_date = datetime.combine(most_common_date, datetime.min.time())
+        print(f"[DATE_EXTRACT] ✅ CONSENSUS REACHED: {result_date.strftime('%Y-%m-%d')}\n")
+       
+        return {
+            'date': result_date,
+            'library': winning_entry['library'],
+            'original_format': original_format,
+            'consensus': f"{count}/{total_parsers} parsers agree"
+        }
+   
+    # If no consensus, use high-confidence result
+    high_conf_dates = [e for e in normalized_dates if e['confidence'] == 'high']
+    if high_conf_dates:
+        result_date = datetime.combine(high_conf_dates[0]['date'], datetime.min.time())
+        print(f"[DATE_EXTRACT] ✅ Using high-confidence: {result_date.strftime('%Y-%m-%d')}\n")
+       
+        return {
+            'date': result_date,
+            'library': high_conf_dates[0]['library'],
+            'original_format': original_format,
+            'consensus': f"high-confidence ({high_conf_dates[0]['library']})"
+        }
+   
+    # Fallback: first result
+    result_date = datetime.combine(normalized_dates[0]['date'], datetime.min.time())
+    print(f"[DATE_EXTRACT] ⚠️  Using first result: {result_date.strftime('%Y-%m-%d')}\n")
+   
+    return {
+        'date': result_date,
+        'library': normalized_dates[0]['library'],
+        'original_format': original_format,
+        'consensus': f"1/{total_parsers} (fallback)"
+    }
+ 
+ 
+def _detect_date_format(query: str, date_obj) -> str:
+    """
+    Detect the original format of the date in the query.
+    """
+    import re
+   
+    # Common patterns with their format descriptions
+    patterns = [
+        (r'\b\d{1,2}[-/]\d{1,2}[-/]\d{4}\b', 'DD/MM/YYYY or MM/DD/YYYY'),
+        (r'\b\d{4}[-/]\d{1,2}[-/]\d{1,2}\b', 'YYYY-MM-DD'),
+        (r'\b\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{4}\b', 'DD Month YYYY'),
+        (r'\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2},?\s+\d{4}\b', 'Month DD, YYYY'),
+        (r'\btomorrow\b', 'relative: tomorrow'),
+        (r'\byesterday\b', 'relative: yesterday'),
+        (r'\btoday\b', 'relative: today'),
+        (r'\bnext\s+week\b', 'relative: next week'),
+        (r'\blast\s+week\b', 'relative: last week'),
+        (r'\bnext\s+month\b', 'relative: next month'),
+        (r'\blast\s+month\b', 'relative: last month'),
+    ]
+   
+    for pattern, format_name in patterns:
+        if re.search(pattern, query, re.IGNORECASE):
+            return format_name
+   
+    return 'natural language'
+ 
+ 
+def _extract_date_from_query_regex(query: str, current_date: datetime) -> datetime:
+    """
+    Fallback regex-based date extraction.
     """
     import re
     from datetime import timedelta
    
+    print("[DATE_EXTRACT] Using regex fallback...")
+   
     # Relative dates
     if 'tomorrow' in query:
+        print("[DATE_EXTRACT] ✓ Regex → tomorrow")
         return current_date + timedelta(days=1)
     if 'yesterday' in query:
+        print("[DATE_EXTRACT] ✓ Regex → yesterday")
         return current_date - timedelta(days=1)
+    if re.search(r'\btoday\b', query):
+        print("[DATE_EXTRACT] ✓ Regex → today")
+        return current_date
+   
+    if re.search(r'\bnext\s+week\b', query):
+        print("[DATE_EXTRACT] ✓ Regex → next week")
+        return current_date + timedelta(weeks=1)
+    if re.search(r'\bnext\s+month\b', query):
+        print("[DATE_EXTRACT] ✓ Regex → next month")
+        return current_date + timedelta(days=30)
+    if re.search(r'\blast\s+week\b', query):
+        print("[DATE_EXTRACT] ✓ Regex → last week")
+        return current_date - timedelta(weeks=1)
+    if re.search(r'\blast\s+month\b', query):
+        print("[DATE_EXTRACT] ✓ Regex → last month")
+        return current_date - timedelta(days=30)
    
     # Specific date patterns
     date_patterns = [
-        # DD/MM/YYYY or DD-MM-YYYY
-        (r'\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b', lambda m: datetime(int(m.group(3)), int(m.group(2)), int(m.group(1)))),
-        # YYYY-MM-DD
-        (r'\b(\d{4})[/-](\d{1,2})[/-](\d{1,2})\b', lambda m: datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))),
-        # Month DD, YYYY or DD Month YYYY
+        (r'\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b',
+         lambda m: datetime(int(m.group(3)), int(m.group(2)), int(m.group(1)))),
+        (r'\b(\d{4})[/-](\d{1,2})[/-](\d{1,2})\b',
+         lambda m: datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))),
         (r'\b(\d{1,2})\s+(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{4})\b',
          lambda m: datetime(int(m.group(3)), _month_to_num(m.group(2)), int(m.group(1)))),
         (r'\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{1,2}),?\s+(\d{4})\b',
          lambda m: datetime(int(m.group(3)), _month_to_num(m.group(1)), int(m.group(2)))),
-        # Just year
-        (r'\b(202[0-9])\b', lambda m: datetime(int(m.group(1)), 1, 1)),
     ]
    
     for pattern, converter in date_patterns:
         match = re.search(pattern, query, re.IGNORECASE)
         if match:
             try:
-                return converter(match)
+                result = converter(match)
+                print(f"[DATE_EXTRACT] ✓ Regex → {result.strftime('%Y-%m-%d')}")
+                return result
             except:
                 continue
    
+    print("[DATE_EXTRACT] ✗ Regex → No match found")
     return None
  
  
@@ -450,20 +716,15 @@ def _month_to_num(month_name: str) -> int:
  
  
 def _extract_json_from_response(response: str) -> str:
-    """
-    Extract JSON from LLM response, handling markdown and extra text.
-    """
+    """Extract JSON from LLM response."""
     import re
    
     if not response or not response.strip():
         raise ValueError("Empty response")
    
     response_cleaned = response.strip()
-   
-    # Remove BOM and invisible characters
     response_cleaned = response_cleaned.lstrip('\ufeff\u200b\u200c\u200d')
    
-    # Remove markdown code blocks
     if "```json" in response_cleaned:
         match = re.search(r'```json\s*(\{.*?\})\s*```', response_cleaned, re.DOTALL)
         if match:
@@ -473,12 +734,316 @@ def _extract_json_from_response(response: str) -> str:
         if match:
             return match.group(1).strip()
    
-    # Extract JSON object using regex
     json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', response_cleaned, re.DOTALL)
     if json_match:
         return json_match.group(0).strip()
    
     return response_cleaned.strip()
+ 
+ 
+ 
+ 
+
+
+
+
+# ------------------------------------------------
+#-------------------------------------------------
+
+def get_season_and_block_context(date_val, rows: list) -> dict:
+    """
+    Derive season label(s) and block-period breakdown from rows.
+    
+    CORRECTED VERSION - Fixes:
+    1. Accurate Indian seasons with Post-Monsoon period
+    2. Handles multi-date/multi-month data safely
+    3. Robust block parsing with type checking
+    4. Safe datetime parsing with error handling
+    5. Handles None values gracefully
+    6. Optimized performance for large datasets
+    """
+    from datetime import datetime
+    
+    # -----------------------------
+    # SEASON LOGIC (CORRECTED)
+    # -----------------------------
+    def month_to_season(month: int) -> str:
+        """
+        Convert month number to Indian season.
+        Indian climate seasons:
+        - Winter: Dec, Jan, Feb (12, 1, 2)
+        - Summer: Mar, Apr, May (3, 4, 5)
+        - Monsoon: Jun, Jul, Aug, Sep (6, 7, 8, 9)
+        - Post-Monsoon: Oct, Nov (10, 11)
+        """
+        if month in (12, 1, 2):
+            return "Winter"
+        elif 3 <= month <= 5:
+            return "Summer"
+        elif 6 <= month <= 9:
+            return "Monsoon"
+        elif month in (10, 11):
+            return "Post-Monsoon"
+        else:
+            return "Unknown"  # Fallback for invalid months
+    
+    # -----------------------------
+    # COLLECT MONTHS FROM DATA
+    # -----------------------------
+    months = set()
+    
+    # Extract months from rows
+    if rows:
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+                
+            # Try to get date from row
+            date_field = r.get("date")
+            if date_field is None:
+                continue
+            
+            try:
+                # Handle different date formats
+                if isinstance(date_field, str):
+                    # Parse ISO format string
+                    dt = datetime.fromisoformat(date_field.replace('Z', '+00:00'))
+                    months.add(dt.month)
+                elif isinstance(date_field, datetime):
+                    months.add(date_field.month)
+                elif hasattr(date_field, 'month'):
+                    # Handle date objects
+                    months.add(date_field.month)
+            except (ValueError, AttributeError, TypeError):
+                # Skip invalid date entries
+                continue
+    
+    # Fallback to date_val if no months found in rows
+    if not months and date_val is not None:
+        try:
+            if isinstance(date_val, str):
+                dt = datetime.fromisoformat(date_val.replace('Z', '+00:00'))
+                months.add(dt.month)
+            elif isinstance(date_val, datetime):
+                months.add(date_val.month)
+            elif hasattr(date_val, 'month'):
+                months.add(date_val.month)
+        except (ValueError, AttributeError, TypeError):
+            pass
+    
+    # Determine season(s)
+    if len(months) == 0:
+        season = None
+    elif len(months) == 1:
+        season = month_to_season(next(iter(months)))
+    else:
+        # Multiple months - check if all same season
+        seasons = {month_to_season(m) for m in months}
+        if len(seasons) == 1:
+            season = next(iter(seasons))
+        else:
+            season = "Multiple Seasons"
+    
+    # -----------------------------
+    # BLOCK PERIOD DEFINITIONS
+    # -----------------------------
+    BLOCK_PERIODS = {
+        "Off-Peak (Night)":   (1, 24),    # 00:00–06:00
+        "Morning Ramp":       (25, 36),   # 06:00–09:00
+        "Morning Peak":       (37, 48),   # 09:00–12:00
+        "Midday":             (49, 60),   # 12:00–15:00
+        "Afternoon Peak":     (61, 72),   # 15:00–18:00
+        "Evening Peak":       (73, 84),   # 18:00–21:00
+        "Night Ramp-down":    (85, 96),   # 21:00–23:45
+    }
+    
+    # -----------------------------
+    # DETECT DEMAND COLUMN (CORRECTED)
+    # -----------------------------
+    demand_key = None
+    
+    if rows and len(rows) > 0 and isinstance(rows[0], dict):
+        # Priority order for demand column detection
+        demand_candidates = [
+            "demand",
+            "actual_demand", 
+            "forecasted_demand",
+            "predicted_demand",
+            "value"
+        ]
+        
+        first_row_keys = set(rows[0].keys())
+        
+        for candidate in demand_candidates:
+            if candidate in first_row_keys:
+                demand_key = candidate
+                break
+    
+    # -----------------------------
+    # BLOCK PERIOD STATISTICS (CORRECTED)
+    # -----------------------------
+    period_stats = {}
+    
+    # Only compute if we have rows, demand key, and block field
+    if rows and demand_key and len(rows) > 0:
+        # Check if block exists in first row
+        if 'block' not in rows[0]:
+            # No block data available
+            return {
+                "season": season,
+                "period_stats": {},
+                "demand_key": demand_key,
+            }
+        
+        for period_name, (lo, hi) in BLOCK_PERIODS.items():
+            values = []
+            
+            for r in rows:
+                if not isinstance(r, dict):
+                    continue
+                
+                try:
+                    # Get block value with type checking
+                    block_val = r.get("block")
+                    if block_val is None:
+                        continue
+                    
+                    # Convert to int safely
+                    try:
+                        b = int(block_val)
+                    except (ValueError, TypeError):
+                        continue
+                    
+                    # Check if block is in range
+                    if not (lo <= b <= hi):
+                        continue
+                    
+                    # Get demand value
+                    demand_val = r.get(demand_key)
+                    if demand_val is None:
+                        continue
+                    
+                    # Convert to float safely
+                    try:
+                        v = float(demand_val)
+                        values.append(v)
+                    except (ValueError, TypeError):
+                        continue
+                        
+                except Exception:
+                    # Skip problematic rows
+                    continue
+            
+            # Only add stats if we have values
+            if values:
+                period_stats[period_name] = {
+                    "count": len(values),
+                    "avg": sum(values) / len(values),
+                    "min": min(values),
+                    "max": max(values),
+                }
+    
+    # -----------------------------
+    # RETURN CONTEXT (CORRECTED)
+    # -----------------------------
+    return {
+        "season": season,
+        "period_stats": period_stats,
+        "demand_key": demand_key,
+    }
+
+
+# -----------------------------
+# HELPER: Get readable time from block number
+# -----------------------------
+def block_to_time_string(block: int) -> str:
+    """
+    Convert block number (1-96) to time string.
+    Each block represents 15 minutes.
+    
+    Args:
+        block: Block number (1-96)
+    
+    Returns:
+        Time string in format "HH:MM"
+    
+    Examples:
+        block_to_time_string(1)  -> "00:00"
+        block_to_time_string(25) -> "06:00"
+        block_to_time_string(96) -> "23:45"
+    """
+    if not isinstance(block, int) or block < 1 or block > 96:
+        return "Invalid"
+    
+    # Block 1 = 00:00, Block 96 = 23:45
+    # Each block = 15 minutes, starting from 00:00
+    total_minutes = (block - 1) * 15
+    hours = total_minutes // 60
+    minutes = total_minutes % 60
+    
+    return f"{hours:02d}:{minutes:02d}"
+
+
+# -----------------------------
+# HELPER: Get block number from time
+# -----------------------------
+def time_to_block(hour: int, minute: int = 0) -> int:
+    """
+    Convert time to block number.
+    
+    Args:
+        hour: Hour (0-23)
+        minute: Minute (0-59)
+    
+    Returns:
+        Block number (1-96)
+    
+    Examples:
+        time_to_block(0, 0)   -> 1
+        time_to_block(6, 0)   -> 25
+        time_to_block(23, 45) -> 96
+    """
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise ValueError("Invalid time")
+    
+    total_minutes = hour * 60 + minute
+    block = (total_minutes // 15) + 1
+    
+    return min(block, 96)  # Cap at 96
+
+
+# -----------------------------
+# HELPER: Get period name from block
+# -----------------------------
+def get_period_from_block(block: int) -> str:
+    """
+    Get period name from block number.
+    
+    Args:
+        block: Block number (1-96)
+    
+    Returns:
+        Period name as string
+    """
+    if not isinstance(block, int) or block < 1 or block > 96:
+        return "Invalid"
+    
+    if 1 <= block <= 24:
+        return "Off-Peak (Night)"
+    elif 25 <= block <= 36:
+        return "Morning Ramp"
+    elif 37 <= block <= 48:
+        return "Morning Peak"
+    elif 49 <= block <= 60:
+        return "Midday"
+    elif 61 <= block <= 72:
+        return "Afternoon Peak"
+    elif 73 <= block <= 84:
+        return "Evening Peak"
+    elif 85 <= block <= 96:
+        return "Night Ramp-down"
+    else:
+        return "Unknown"
 
 
 # -------------------------
@@ -1150,6 +1715,11 @@ Create a natural, human-readable response to the user's query.
             show_technical=show_tech
         )
         
+        date_val = None
+        if rows:
+            date_val = rows[0].get("date")
+        ctx = get_season_and_block_context(date_val, rows)
+
         response = _get_llm().invoke(messages).content
         
         if show_tech:
