@@ -13,7 +13,6 @@ warnings.filterwarnings('ignore')
 # CONFIG
 # ------------------------------------------------
 DB_PATH = Path("data/load_forecasting.db")
-RUN_DATE = "2026-01-15"
 MODEL_ID = 202
 HORIZON_TYPE = "day_ahead"
 MODEL_PATH = "amazon/chronos-t5-small"
@@ -25,6 +24,10 @@ MAX_ALLOWED_GAP_HOURS = 36
 # Lookback parameters
 LBY = 0  # lookback years
 LBM = 4  # lookback months
+
+# Feature adjustment parameters
+HOLIDAY_DAMPENING = 0.3  # How much to apply holiday adjustment (0-1)
+HI_DAMPENING = 0.3  # How much to apply heat index adjustment (0-1)
 
 # ------------------------------------------------
 # UTILITY FUNCTIONS
@@ -259,11 +262,98 @@ def prepare_test_data(conn, input_date, hrs_start=6):
     
     return df
 
-def run_and_store_forecast(run_date: str, *, db_path: str | None = None, model_id: int | None = None, model_path: str | None = None, horizon_type: str | None = None) -> dict:
+def apply_feature_adjustments(predictions, df_train, df_test_features, 
+                              holiday_dampening=0.3, hi_dampening=0.3):
+    """
+    Apply feature-based adjustments to Chronos predictions.
+    
+    Args:
+        predictions: Raw predictions from Chronos
+        df_train: Training dataframe with historical data
+        df_test_features: Test features for the forecast period (normal_holiday, hi)
+        holiday_dampening: Weight for holiday adjustment (0-1)
+        hi_dampening: Weight for heat index adjustment (0-1)
+    
+    Returns:
+        Adjusted predictions
+    """
+    adjusted_predictions = predictions.copy()
+    
+    # 1. Calculate holiday impact
+    train_holiday = df_train[df_train['normal_holiday'] == 1]['y']
+    train_non_holiday = df_train[df_train['normal_holiday'] == 0]['y']
+    
+    if len(train_holiday) > 0 and len(train_non_holiday) > 0:
+        holiday_ratio = train_holiday.mean() / train_non_holiday.mean()
+        print(f"   Holiday ratio: {holiday_ratio:.3f}")
+    else:
+        holiday_ratio = 1.0
+        print("   No holiday data for adjustment")
+    
+    # 2. Calculate heat index impact using quantile-based approach
+    hi_adjustment = np.ones(len(predictions))
+    
+    if 'hi' in df_train.columns and df_train['hi'].notna().sum() > 0:
+        try:
+            # Create heat index quintiles from training data
+            df_train_copy = df_train.copy()
+            df_train_copy['hi_quintile'] = pd.qcut(
+                df_train_copy['hi'], 
+                q=5, 
+                labels=False, 
+                duplicates='drop'
+            )
+            
+            # Calculate mean demand by quintile
+            hi_impact = df_train_copy.groupby('hi_quintile')['y'].mean()
+            overall_mean = df_train_copy['y'].mean()
+            
+            # Map forecast hi to quintiles
+            df_test_copy = df_test_features.copy()
+            df_test_copy['hi_quintile'] = pd.qcut(
+                df_test_copy['hi'], 
+                q=5, 
+                labels=False, 
+                duplicates='drop'
+            )
+            
+            # Calculate adjustment factor for each forecast point
+            for i in range(len(predictions)):
+                if i < len(df_test_copy):
+                    quintile = df_test_copy.iloc[i]['hi_quintile']
+                    if quintile is not None and quintile in hi_impact.index:
+                        hi_adjustment[i] = hi_impact[quintile] / overall_mean
+            
+            print(f"   HI adjustment range: {hi_adjustment.min():.3f} - {hi_adjustment.max():.3f}")
+        except Exception as e:
+            print(f"   Warning: Could not calculate HI adjustment: {e}")
+            hi_adjustment = np.ones(len(predictions))
+    else:
+        print("   No HI data for adjustment")
+    
+    # 3. Apply combined adjustments
+    for i in range(len(predictions)):
+        adjustment_factor = 1.0
+        
+        # Apply holiday adjustment
+        if i < len(df_test_features) and df_test_features.iloc[i]['normal_holiday'] == 1:
+            adjustment_factor *= (1 + holiday_dampening * (holiday_ratio - 1))
+        
+        # Apply heat index adjustment
+        adjustment_factor *= (1 + hi_dampening * (hi_adjustment[i] - 1))
+        
+        adjusted_predictions[i] = predictions[i] * adjustment_factor
+    
+    return adjusted_predictions
+
+def run_and_store_forecast(run_date: str, *, db_path: str | None = None, model_id: int | None = None, 
+                           model_path: str | None = None, horizon_type: str | None = None,
+                           use_feature_adjustment: bool = True) -> dict:
     """Run forecast for `run_date` and store results in DB.
 
     Returns:
-        dict: {ok: bool, rows_written: int, prediction_date: str, model_id: int, metrics: {mape, rmse} | None, error: str | None}
+        dict: {ok: bool, rows_written: int, prediction_date: str, model_id: int, 
+               metrics: {mape, rmse, mape_adjusted, rmse_adjusted} | None, error: str | None}
     """
     # Use module defaults when values are not provided
     run_date = str(run_date)
@@ -280,10 +370,8 @@ def run_and_store_forecast(run_date: str, *, db_path: str | None = None, model_i
     # Create table in a DB-compatible way
     if cfg.get("type") == "postgresql":
         cur = conn.cursor()
-        # prefer the `lf` schema (other code uses lf.*); create it if missing
         target_schema = "lf"
         cur.execute('CREATE SCHEMA IF NOT EXISTS "lf"')
-        # check if table exists in the target schema
         cur.execute(
             "SELECT 1 FROM information_schema.tables WHERE table_schema = %s AND table_name = %s",
             (target_schema, "t_predicted_demand_chatbot"),
@@ -307,10 +395,8 @@ def run_and_store_forecast(run_date: str, *, db_path: str | None = None, model_i
             conn.commit()
             print(f"[DB] Created table {target_schema}.t_predicted_demand_chatbot")
         else:
-            # ensure any pending transactional DDL is visible
             conn.commit()
     else:
-        # sqlite
         cur = conn.cursor()
         cur.execute(
             """
@@ -331,33 +417,56 @@ def run_and_store_forecast(run_date: str, *, db_path: str | None = None, model_i
 
     # Initialize Chronos pipeline
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"\n[Model] Loading Chronos from {model_path} on {device}...")
 
     pipeline = ChronosPipeline.from_pretrained(
         model_path,
         device_map="cpu",
-        torch_dtype=torch.float32   # CPU-friendly
+        torch_dtype=torch.float32
     )
 
-
     # Prepare data
+    print(f"[Data] Preparing training data for {run_date}...")
     df_train_raw = prepare_train_data(conn, run_date, lby=LBY, lbm=LBM, hrs_end=5)
     df_test_raw = prepare_test_data(conn, run_date, hrs_start=6)
 
     df_train_in = dedupe_index(df_train_raw).asfreq(FREQ).round(2)
     df_test_in = dedupe_index(df_test_raw).asfreq(FREQ).round(2)
+    
+    print(f"   Train size: {len(df_train_in)} records")
+    print(f"   Test size: {len(df_test_in)} records")
 
-    # Prepare training series (just demand values)
+    # Prepare training series (just demand values for Chronos)
     context = torch.tensor(df_train_in['y'].values, dtype=torch.float32).unsqueeze(0)
 
     # Run prediction
+    print(f"[Forecast] Running Chronos prediction for {BLOCKS_PER_DAY} blocks...")
     with torch.no_grad():
         forecast = pipeline.predict(
             context,
             prediction_length=BLOCKS_PER_DAY,
-            num_samples=5        # ↓ big speedup
+            num_samples=5
         )
 
-    predictions = forecast[0].median(dim=0).values.numpy()
+    predictions_raw = forecast[0].median(dim=0).values.numpy()
+    
+    # Apply feature-based adjustments if enabled
+    if use_feature_adjustment:
+        print(f"[Adjustment] Applying feature adjustments (normal_holiday, hi)...")
+        
+        # Get test features for the forecast period
+        forecast_features = df_test_in.iloc[-BLOCKS_PER_DAY:][['normal_holiday', 'hi']].copy()
+        
+        predictions = apply_feature_adjustments(
+            predictions_raw, 
+            df_train_in, 
+            forecast_features,
+            holiday_dampening=HOLIDAY_DAMPENING,
+            hi_dampening=HI_DAMPENING
+        )
+    else:
+        predictions = predictions_raw
+        print(f"[Adjustment] Feature adjustment disabled, using raw predictions")
 
     # Create forecast timestamps
     forecast_index = pd.date_range(
@@ -371,9 +480,22 @@ def run_and_store_forecast(run_date: str, *, db_path: str | None = None, model_i
 
     metrics = None
     if y_true is not None and len(y_true) == len(predictions):
+        # Calculate metrics for adjusted predictions
         mape = mean_absolute_percentage_error(y_true=y_true, y_pred=predictions) * 100
         rmse = root_mean_squared_error(y_true=y_true, y_pred=predictions)
-        metrics = {"mape": float(mape), "rmse": float(rmse)}
+        
+        # Also calculate metrics for raw predictions for comparison
+        mape_raw = mean_absolute_percentage_error(y_true=y_true, y_pred=predictions_raw) * 100
+        rmse_raw = root_mean_squared_error(y_true=y_true, y_pred=predictions_raw)
+        
+        metrics = {
+            "mape": float(mape), 
+            "rmse": float(rmse),
+            "mape_raw": float(mape_raw),
+            "rmse_raw": float(rmse_raw),
+            "improvement_mape": float(mape_raw - mape),
+            "improvement_rmse": float(rmse_raw - rmse)
+        }
 
     # Format result dataframe
     result_df = pd.DataFrame({
@@ -387,26 +509,20 @@ def run_and_store_forecast(run_date: str, *, db_path: str | None = None, model_i
         "version": Path(model_path).stem if model_path else "unknown"
     })
 
-    # Verify table is queryable
+    # Verify and insert data
     if cfg.get("type") == "postgresql":
         cur.execute(
             "SELECT COUNT(*) FROM lf.t_predicted_demand_chatbot WHERE 1=0"
         )
-        print(f"[DB] Verified table lf.t_predicted_demand_chatbot is accessible")
-
-    # Delete existing predictions for the same date/model/horizon (idempotent)
-    if cfg.get("type") == "postgresql":
-        # use schema-qualified name
+        
         schema = "lf"
         fq_table = f'"{schema}"."t_predicted_demand_chatbot"'
 
-        # Ensure the table exists (defensive)
         cur.execute(
             "SELECT 1 FROM information_schema.tables WHERE table_schema = %s AND table_name = %s",
             (schema, "t_predicted_demand_chatbot"),
         )
         if not cur.fetchone():
-            # create table from the DataFrame-like schema (safe fallback)
             cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
             cur.execute(
                 f'''
@@ -424,16 +540,13 @@ def run_and_store_forecast(run_date: str, *, db_path: str | None = None, model_i
                 '''
             )
             conn.commit()
-            print(f"[DB] Created table {schema}.t_predicted_demand_chatbot (fallback)")
 
-        # delete existing rows from the correct schema-qualified table
         cur.execute(
             f"DELETE FROM {fq_table} WHERE prediction_date = %s AND model_id = %s AND horizon_type = %s",
             (run_date, model_id, horizon_type),
         )
         conn.commit()
 
-        # Bulk insert using execute_batch for performance
         from psycopg2.extras import execute_batch
         insert_sql = (
             f"INSERT INTO {fq_table}"
@@ -458,7 +571,6 @@ def run_and_store_forecast(run_date: str, *, db_path: str | None = None, model_i
             conn.commit()
 
     else:
-        # sqlite path: use pandas.to_sql
         cur.execute(
             "DELETE FROM t_predicted_demand_chatbot WHERE prediction_date = ? AND model_id = ? AND horizon_type = ?",
             (str(run_date), model_id, horizon_type),
@@ -471,9 +583,9 @@ def run_and_store_forecast(run_date: str, *, db_path: str | None = None, model_i
             if_exists="append",
             index=False,
         )
+    
     rows_written = len(result_df)
 
-    # Close DB connection
     try:
         conn.close()
     except Exception:
@@ -488,12 +600,112 @@ def run_and_store_forecast(run_date: str, *, db_path: str | None = None, model_i
     }
 
 
+def backtest_last_5_days():
+    """
+    Backtest forecast for last 5 days of December 2025 (Dec 26-31).
+    For each day, use data up to 05:45 AM of the previous day.
+    """
+    forecast_dates = [
+        "2025-12-26",
+        "2025-12-27", 
+        "2025-12-28",
+        "2025-12-29",
+        "2025-12-30",
+        "2025-12-31"
+    ]
+    
+    print("=" * 80)
+    print("BACKTESTING: Last 5 Days of December 2025")
+    print("=" * 80)
+    print(f"Forecast dates: {', '.join(forecast_dates)}")
+    print(f"Features: normal_holiday, hi (heat index)")
+    print(f"Model: {MODEL_PATH}")
+    print("=" * 80)
+    
+    all_results = []
+    
+    for date in forecast_dates:
+        print(f"\n{'='*80}")
+        print(f"FORECASTING FOR: {date}")
+        print(f"{'='*80}")
+        
+        try:
+            result = run_and_store_forecast(
+                date,
+                model_id=MODEL_ID,
+                model_path=MODEL_PATH,
+                horizon_type=HORIZON_TYPE,
+                use_feature_adjustment=True
+            )
+            
+            if result.get("ok"):
+                print(f"\n✅ Forecast completed for {date}")
+                print(f"   Rows written: {result['rows_written']}")
+                
+                if result.get("metrics"):
+                    m = result['metrics']
+                    print(f"\n   📊 METRICS:")
+                    print(f"      Raw Chronos  -> MAPE: {m.get('mape_raw', 0):.2f}%  RMSE: {m.get('rmse_raw', 0):.2f}")
+                    print(f"      With Features-> MAPE: {m.get('mape', 0):.2f}%  RMSE: {m.get('rmse', 0):.2f}")
+                    print(f"      Improvement  -> MAPE: {m.get('improvement_mape', 0):.2f}%  RMSE: {m.get('improvement_rmse', 0):.2f}")
+                
+                all_results.append({
+                    'date': date,
+                    'success': True,
+                    **result
+                })
+            else:
+                print(f"❌ Forecast failed for {date}: {result.get('error')}")
+                all_results.append({
+                    'date': date,
+                    'success': False,
+                    'error': result.get('error')
+                })
+                
+        except Exception as e:
+            print(f"❌ Exception during forecast for {date}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            all_results.append({
+                'date': date,
+                'success': False,
+                'error': str(e)
+            })
+    
+    # Summary
+    print(f"\n{'='*80}")
+    print("BACKTEST SUMMARY")
+    print(f"{'='*80}")
+    
+    successful = [r for r in all_results if r.get('success')]
+    failed = [r for r in all_results if not r.get('success')]
+    
+    print(f"Total forecasts: {len(all_results)}")
+    print(f"Successful: {len(successful)}")
+    print(f"Failed: {len(failed)}")
+    
+    if successful:
+        print(f"\n📈 AVERAGE METRICS (across successful forecasts):")
+        avg_mape = np.mean([r['metrics']['mape'] for r in successful if r.get('metrics')])
+        avg_rmse = np.mean([r['metrics']['rmse'] for r in successful if r.get('metrics')])
+        avg_mape_raw = np.mean([r['metrics']['mape_raw'] for r in successful if r.get('metrics')])
+        avg_rmse_raw = np.mean([r['metrics']['rmse_raw'] for r in successful if r.get('metrics')])
+        
+        print(f"   Raw Chronos  -> MAPE: {avg_mape_raw:.2f}%  RMSE: {avg_rmse_raw:.2f}")
+        print(f"   With Features-> MAPE: {avg_mape:.2f}%  RMSE: {avg_rmse:.2f}")
+        print(f"   Improvement  -> MAPE: {avg_mape_raw - avg_mape:.2f}%  RMSE: {avg_rmse_raw - avg_rmse:.2f}")
+    
+    if failed:
+        print(f"\n❌ Failed forecasts:")
+        for r in failed:
+            print(f"   {r['date']}: {r.get('error', 'Unknown error')}")
+    
+    print("=" * 80)
+    
+    return all_results
+
+
 # Backwards-compatible CLI behavior
 if __name__ == "__main__":
-    res = run_and_store_forecast(RUN_DATE)
-    if res.get("ok"):
-        print(f"✅ Forecast stored for {res['prediction_date']} (rows={res['rows_written']})")
-        if res.get("metrics"):
-            print(f"   MAPE: {res['metrics'].get('mape'):.2f}%  RMSE: {res['metrics'].get('rmse'):.2f}")
-    else:
-        print("❌ Forecast run failed:", res.get("error"))
+    # Run backtest for last 5 days
+    results = backtest_last_5_days()
