@@ -1555,8 +1555,10 @@ def summarization_agent(state: GraphState) -> GraphState:
 
 
 def execute_graph_plotting(state: GraphState) -> GraphState:
-    """IMPROVED: Execute graph plotting with user_query context"""
-    print("[GRAPH_EXEC] Starting graph generation")
+    """
+    Returns structured data for frontend chart libraries (Chart.js, Recharts, etc.)
+    """
+    print("[GRAPH_EXEC] Starting graph data generation")
     
     graph_metadata = state.graph_data
     sql = graph_metadata.get("sql")
@@ -1570,29 +1572,54 @@ def execute_graph_plotting(state: GraphState) -> GraphState:
     print(f"[GRAPH_EXEC] User query: {user_query[:100]}...")
     
     try:
-        # IMPROVED: Call graph_plotting_tool with both SQL AND user_query
-        plot_result = graph_plotting_tool.invoke({
-            "sql": sql,
-            "user_query": user_query
-        })
+        # Execute SQL to get data
+        from tools import execute_query
+        result = execute_query(sql)
         
-        print(f"[GRAPH_EXEC] Result: ok={plot_result.get('ok')}")
+        if not result.get("ok"):
+            print(f"[GRAPH_EXEC] SQL execution failed: {result.get('error')}")
+            state.graph_data["ok"] = False
+            state.graph_data["error"] = result.get('error')
+            return state
         
-        if plot_result.get("ok"):
-            print("[GRAPH_EXEC] ✓✓✓ GRAPH SUCCESS!")
-            state.graph_data = plot_result
-            state.graph_data["plot_success"] = True
+        rows = result.get("rows", [])
+        if not rows:
+            print("[GRAPH_EXEC] No data rows returned")
+            state.graph_data["ok"] = False
+            state.graph_data["error"] = "No data available for visualization"
+            return state
+        
+        # Convert rows to list of dicts
+        data_rows = [dict(row) for row in rows]
+        
+        # Determine chart type and prepare data
+        chart_config = prepare_chart_data(data_rows, user_query)
+        
+        if chart_config:
+            state.graph_data = {
+                "ok": True,
+                "chart_type": chart_config["chart_type"],
+                "labels": chart_config["labels"],
+                "datasets": chart_config["datasets"],
+                "title": chart_config["title"],
+                "x_axis_label": chart_config.get("x_axis_label", ""),
+                "y_axis_label": chart_config.get("y_axis_label", "Demand (MW)"),
+                "data_points": len(chart_config["labels"]),
+                "metadata": chart_config.get("metadata", {})
+            }
+            print(f"[GRAPH_EXEC] ✓✓✓ GRAPH DATA PREPARED!")
+            print(f"[GRAPH_EXEC] Chart type: {chart_config['chart_type']}")
+            print(f"[GRAPH_EXEC] Data points: {len(chart_config['labels'])}")
         else:
-            print(f"[GRAPH_EXEC] Graph FAILED: {plot_result.get('error')}")
-            state.graph_data["plot_success"] = False
-            state.graph_data["plot_error"] = plot_result.get('error')
+            state.graph_data["ok"] = False
+            state.graph_data["error"] = "Could not prepare chart data"
             
     except Exception as e:
         print(f"[GRAPH_EXEC] EXCEPTION: {e}")
         import traceback
         traceback.print_exc()
-        state.graph_data["plot_success"] = False
-        state.graph_data["plot_error"] = str(e)
+        state.graph_data["ok"] = False
+        state.graph_data["error"] = str(e)
     
     return state
 
@@ -1923,3 +1950,168 @@ Avoid bullet points unless listing specific items.
 
     state.final_answer = response
     return state
+
+def prepare_chart_data(rows: list, user_query: str) -> dict:
+    """
+    Prepare structured chart data from database rows
+    
+    Returns:
+        {
+            "chart_type": "line" | "bar" | "area",
+            "labels": ["2025-01-01", "2025-01-02", ...],
+            "datasets": [
+                {
+                    "label": "Actual Demand",
+                    "data": [1250.5, 1300.2, ...],
+                    "borderColor": "#667eea",
+                    "backgroundColor": "rgba(102, 126, 234, 0.1)"
+                }
+            ],
+            "title": "Demand Trend",
+            "x_axis_label": "Date",
+            "y_axis_label": "Demand (MW)",
+            "metadata": {...}
+        }
+    """
+    if not rows:
+        return None
+    
+    # Detect available columns
+    first_row = rows[0]
+    columns = list(first_row.keys())
+    
+    print(f"[CHART_PREP] Available columns: {columns}")
+    
+    # Determine chart type based on query
+    chart_type = detect_chart_type(user_query, columns)
+    
+    # Detect time/date column
+    time_col = None
+    for col in ['datetime', 'date', 'time', 'timestamp', 'block']:
+        if col in columns:
+            time_col = col
+            break
+    
+    # Detect value columns (numeric columns excluding ID/block)
+    value_cols = []
+    for col in columns:
+        if col not in ['datetime', 'date', 'time', 'timestamp', 'id', 'model_id']:
+            # Check if numeric
+            try:
+                val = first_row[col]
+                if isinstance(val, (int, float)) or (isinstance(val, str) and val.replace('.', '').replace('-', '').isdigit()):
+                    value_cols.append(col)
+            except:
+                pass
+    
+    print(f"[CHART_PREP] Time column: {time_col}")
+    print(f"[CHART_PREP] Value columns: {value_cols}")
+    
+    if not time_col or not value_cols:
+        print("[CHART_PREP] ERROR: Missing time or value columns")
+        return None
+    
+    # Extract labels (X-axis)
+    labels = []
+    for row in rows:
+        label = str(row[time_col])
+        # Format datetime if needed
+        if 'T' in label or len(label) > 10:
+            try:
+                from datetime import datetime
+                dt = datetime.fromisoformat(label.replace('Z', '+00:00'))
+                label = dt.strftime('%Y-%m-%d %H:%M')
+            except:
+                pass
+        labels.append(label)
+    
+    # Extract datasets (Y-axis values)
+    datasets = []
+    colors = [
+        {"border": "#667eea", "bg": "rgba(102, 126, 234, 0.1)"},
+        {"border": "#764ba2", "bg": "rgba(118, 75, 162, 0.1)"},
+        {"border": "#f093fb", "bg": "rgba(240, 147, 251, 0.1)"},
+        {"border": "#4facfe", "bg": "rgba(79, 172, 254, 0.1)"},
+    ]
+    
+    for idx, col in enumerate(value_cols):
+        data = []
+        for row in rows:
+            try:
+                val = float(row[col])
+                data.append(round(val, 2))
+            except:
+                data.append(None)
+        
+        # Format label nicely
+        label = col.replace('_', ' ').title()
+        if 'demand' in col.lower():
+            label = label.replace('Demand', 'Demand (MW)')
+        
+        color = colors[idx % len(colors)]
+        
+        dataset = {
+            "label": label,
+            "data": data,
+            "borderColor": color["border"],
+            "backgroundColor": color["bg"],
+            "tension": 0.4 if chart_type == "line" else 0,
+            "fill": True if chart_type == "area" else False
+        }
+        
+        datasets.append(dataset)
+    
+    # Generate title
+    title = generate_chart_title(user_query, value_cols)
+    
+    # Determine axis labels
+    x_axis_label = "Time" if time_col in ['datetime', 'timestamp'] else time_col.replace('_', ' ').title()
+    y_axis_label = "Demand (MW)" if any('demand' in col.lower() for col in value_cols) else "Value"
+    
+    return {
+        "chart_type": chart_type,
+        "labels": labels,
+        "datasets": datasets,
+        "title": title,
+        "x_axis_label": x_axis_label,
+        "y_axis_label": y_axis_label,
+        "metadata": {
+            "total_points": len(labels),
+            "value_columns": value_cols,
+            "time_column": time_col
+        }
+    }
+
+
+def detect_chart_type(query: str, columns: list) -> str:
+    """
+    Detect appropriate chart type based on query and data
+    """
+    query_lower = query.lower()
+    
+    # Bar chart keywords
+    if any(word in query_lower for word in ['compare', 'comparison', 'vs', 'versus', 'bar']):
+        return "bar"
+    
+    # Area chart keywords
+    if any(word in query_lower for word in ['area', 'filled']):
+        return "area"
+    
+    # Line chart (default for trends, time series)
+    return "line"
+
+
+def generate_chart_title(query: str, value_cols: list) -> str:
+    """Generate appropriate chart title"""
+    query_lower = query.lower()
+    
+    if 'forecast' in query_lower:
+        return "Demand Forecast"
+    elif 'actual' in query_lower and 'forecast' not in query_lower:
+        return "Actual Demand"
+    elif 'trend' in query_lower:
+        return f"{value_cols[0].replace('_', ' ').title()} Trend"
+    elif 'compare' in query_lower or 'comparison' in query_lower:
+        return "Demand Comparison"
+    else:
+        return "Demand Analysis"

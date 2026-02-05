@@ -1,7 +1,8 @@
-// app.js
+// app.js - FULLY EDITED VERSION WITH CHART.JS INTEGRATION
 const API_BASE_URL = 'http://localhost:8013/api/v1/forecast';
 
 let messageHistory = [];
+let chartInstances = {}; // ADDED: Store chart instances for cleanup
 
 // Initialize
 document.addEventListener('DOMContentLoaded', () => {
@@ -54,6 +55,9 @@ async function sendQuery() {
         
         const data = await response.json();
         
+        // ADDED: Log response for debugging
+        console.log('[FRONTEND] Response:', data);
+        
         // Add assistant response
         addAssistantResponse(data);
         
@@ -97,14 +101,10 @@ function addAssistantResponse(data) {
     
     let content = `<div>${formatText(data.answer)}</div>`;
     
-    // Add SQL query if available
-    if (data.sql_query) {
-        content += `
-            <div class="metadata">
-                <strong>📊 SQL Query:</strong><br>
-                <code>${escapeHtml(data.sql_query)}</code>
-            </div>
-        `;
+    // MODIFIED: Add chart if available (NEW: Render using Chart.js)
+    if (data.has_chart && data.chart_data) {
+        console.log('[FRONTEND] Rendering chart:', data.chart_data);
+        content += createChartElement(data.chart_data);
     }
     
     // Add data table if available
@@ -112,17 +112,12 @@ function addAssistantResponse(data) {
         content += createDataTable(data.sample_data, data.row_count);
     }
     
-    // Add graph if available
-    if (data.has_graph && data.graph_image) {
+    // Add SQL query if available
+    if (data.sql_query) {
         content += `
-            <div class="graph-container">
-                <img src="data:image/png;base64,${data.graph_image}" alt="Data Visualization">
-                ${data.graph_data ? `
-                    <div class="metadata">
-                        <strong>📈 Graph Info:</strong> 
-                        ${data.graph_data.plot_type} plot with ${data.graph_data.data_points} data points
-                    </div>
-                ` : ''}
+            <div class="metadata">
+                <strong>📊 SQL Query:</strong><br>
+                <code>${escapeHtml(data.sql_query)}</code>
             </div>
         `;
     }
@@ -156,6 +151,12 @@ function addAssistantResponse(data) {
     messageDiv.innerHTML = `<div class="message-content">${content}</div>`;
     
     chatArea.appendChild(messageDiv);
+    
+    // ADDED: Render chart after DOM insertion
+    if (data.has_chart && data.chart_data) {
+        renderChart(data.chart_data);
+    }
+    
     scrollToBottom();
     
     messageHistory.push({ role: 'assistant', content: data.answer });
@@ -221,7 +222,131 @@ function createDataTable(data, totalRows) {
     return html;
 }
 
-// Utility functions
+// ═══════════════════════════════════════════════════════════════════════════
+// ADDED: NEW CHART.JS FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Create chart element (placeholder for Chart.js canvas)
+function createChartElement(chartData) {
+    const chartId = `chart_${Date.now()}`;
+    
+    return `
+        <div class="chart-container">
+            <div class="chart-title">${escapeHtml(chartData.title)}</div>
+            <canvas id="${chartId}" class="chart-canvas"></canvas>
+            <div class="chart-metadata">
+                <strong>📈 Chart Info:</strong> 
+                ${chartData.chart_type.toUpperCase()} chart with ${chartData.data_points.toLocaleString()} data points
+                ${chartData.x_axis_label ? ` | X: ${chartData.x_axis_label}` : ''}
+                ${chartData.y_axis_label ? ` | Y: ${chartData.y_axis_label}` : ''}
+            </div>
+        </div>
+    `;
+}
+
+// Render Chart.js chart
+function renderChart(chartData) {
+    // Find the most recent canvas element
+    const canvases = document.querySelectorAll('canvas.chart-canvas');
+    const canvas = canvases[canvases.length - 1];
+    
+    if (!canvas) {
+        console.error('[FRONTEND] Canvas element not found');
+        return;
+    }
+    
+    const ctx = canvas.getContext('2d');
+    const chartId = canvas.id;
+    
+    // Destroy existing chart if any
+    if (chartInstances[chartId]) {
+        chartInstances[chartId].destroy();
+    }
+    
+    // Prepare datasets
+    const datasets = chartData.datasets.map(ds => ({
+        label: ds.label,
+        data: ds.data,
+        borderColor: ds.borderColor,
+        backgroundColor: ds.backgroundColor,
+        tension: ds.tension || 0.4,
+        fill: ds.fill || false,
+        borderWidth: 2,
+        pointRadius: chartData.data_points > 100 ? 0 : 3,
+        pointHoverRadius: 5
+    }));
+    
+    // Chart configuration
+    const config = {
+        type: chartData.chart_type,
+        data: {
+            labels: chartData.labels,
+            datasets: datasets
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: true,
+            plugins: {
+                legend: {
+                    display: true,
+                    position: 'top',
+                },
+                tooltip: {
+                    mode: 'index',
+                    intersect: false,
+                    callbacks: {
+                        label: function(context) {
+                            let label = context.dataset.label || '';
+                            if (label) {
+                                label += ': ';
+                            }
+                            label += context.parsed.y.toFixed(2);
+                            return label;
+                        }
+                    }
+                }
+            },
+            scales: {
+                x: {
+                    display: true,
+                    title: {
+                        display: !!chartData.x_axis_label,
+                        text: chartData.x_axis_label
+                    },
+                    ticks: {
+                        maxRotation: 45,
+                        minRotation: 0,
+                        autoSkip: true,
+                        maxTicksLimit: 20
+                    }
+                },
+                y: {
+                    display: true,
+                    title: {
+                        display: !!chartData.y_axis_label,
+                        text: chartData.y_axis_label
+                    },
+                    beginAtZero: false
+                }
+            },
+            interaction: {
+                mode: 'nearest',
+                axis: 'x',
+                intersect: false
+            }
+        }
+    };
+    
+    // Create chart
+    chartInstances[chartId] = new Chart(ctx, config);
+    
+    console.log('[FRONTEND] Chart rendered successfully:', chartId);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// UTILITY FUNCTIONS (UNCHANGED)
+// ═══════════════════════════════════════════════════════════════════════════
+
 function showLoading(show) {
     const loading = document.getElementById('loading');
     if (show) {

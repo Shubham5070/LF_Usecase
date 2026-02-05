@@ -13,6 +13,7 @@ import logging
 from pathlib import Path
 import base64
 import io
+from datetime import datetime
 
 # Import your existing modules
 from graph import build_graph
@@ -59,6 +60,26 @@ async def startup_event():
     cleanup_old_plots(days_to_keep=7)
     logger.info("[STARTUP] ✅ Cleanup complete")
 
+class ChartDataset(BaseModel):
+    """Chart dataset model"""
+    label: str
+    data: List[float]
+    borderColor: str
+    backgroundColor: str
+    tension: Optional[float] = 0.4
+    fill: Optional[bool] = False
+
+
+class ChartData(BaseModel):
+    """Chart data model for frontend rendering"""
+    chart_type: str = Field(..., description="Type of chart: line, bar, area")
+    labels: List[str] = Field(..., description="X-axis labels")
+    datasets: List[ChartDataset] = Field(..., description="Chart datasets")
+    title: str = Field(..., description="Chart title")
+    x_axis_label: Optional[str] = Field("", description="X-axis label")
+    y_axis_label: Optional[str] = Field("Value", description="Y-axis label")
+    data_points: int = Field(..., description="Total number of data points")
+    metadata: Optional[Dict[str, Any]] = Field(None, description="Additional metadata")
 
 # -------------------------
 # REQUEST & RESPONSE MODELS
@@ -87,10 +108,9 @@ class QueryResponse(BaseModel):
     row_count: Optional[int] = Field(None, description="Number of rows returned")
     sample_data: Optional[List[Dict[str, Any]]] = Field(None, description="Sample data rows")
     
-    # Graph fields (production-grade: return URL instead of base64)
-    has_graph: bool = Field(default=False, description="Whether a graph was generated")
-    graph_data: Optional[Dict[str, Any]] = Field(None, description="Graph metadata")
-    graph_url: Optional[str] = Field(None, description="URL to fetch the graph image")
+    # NEW: Chart data (JSON format for frontend rendering)
+    has_chart: bool = Field(default=False, description="Whether chart data is available")
+    chart_data: Optional[ChartData] = Field(None, description="Structured chart data for rendering")
     
     # Metadata
     metadata: Optional[Dict[str, Any]] = Field(None, description="Additional metadata")
@@ -174,28 +194,35 @@ async def query_endpoint(req: QueryRequest):
             if rows:
                 sample_data = [dict(row) if hasattr(row, 'keys') else row for row in rows[:5]]
         
-        # Extract graph information
-        has_graph = False
-        graph_url = None
-        graph_metadata = None
+        # Extract chart data (NEW FORMAT)
+        has_chart = False
+        chart_data_obj = None
         
         if graph_data and isinstance(graph_data, dict) and graph_data.get("ok"):
-            has_graph = True
-            filename = graph_data.get("filename")
+            has_chart = True
             
-            graph_metadata = {
-                "plot_type": graph_data.get("plot_type"),
-                "data_points": graph_data.get("data_points"),
-                "filename": filename,
-                "filepath": graph_data.get("filepath")
-            }
-            
-            # Return URL to fetch image instead of embedding base64
-            if filename:
-                # Extract image ID (filename without .png extension)
-                image_id = filename.replace('.png', '')
-                graph_url = f"/api/v1/forecast/graph/{image_id}"
-            
+            # Build ChartData object
+            try:
+                datasets = []
+                for ds in graph_data.get("datasets", []):
+                    datasets.append(ChartDataset(**ds))
+                
+                chart_data_obj = ChartData(
+                    chart_type=graph_data.get("chart_type", "line"),
+                    labels=graph_data.get("labels", []),
+                    datasets=datasets,
+                    title=graph_data.get("title", "Chart"),
+                    x_axis_label=graph_data.get("x_axis_label", ""),
+                    y_axis_label=graph_data.get("y_axis_label", "Value"),
+                    data_points=graph_data.get("data_points", 0),
+                    metadata=graph_data.get("metadata", {})
+                )
+                
+                logger.info(f"[API] ✅ Chart data prepared: {chart_data_obj.chart_type} with {chart_data_obj.data_points} points")
+                
+            except Exception as e:
+                logger.error(f"[API] Error building chart data: {e}")
+                has_chart = False    
 
         logger.info(f"[API] ✅ Query processed successfully - Intent: {intent}")
         
@@ -206,14 +233,14 @@ async def query_endpoint(req: QueryRequest):
             sql_query=sql_query,
             row_count=row_count,
             sample_data=sample_data,
-            has_graph=has_graph,
-            graph_data=graph_metadata,
-            graph_url=graph_url,
+            has_chart=has_chart,
+            chart_data=chart_data_obj,
             metadata={
                 "need_db_call": result.get("need_db_call", False),
                 "need_graph": result.get("need_graph", False),
                 "is_out_of_range": result.get("is_out_of_range", False)
-            }
+            },
+            timestamp=datetime.utcnow().isoformat() + "Z"
         )
         
     except Exception as e:
@@ -226,88 +253,7 @@ async def query_endpoint(req: QueryRequest):
             answer="An error occurred while processing your query.",
             error=str(e)
         )
-
-
-@router.get("/graph/{image_id}")
-async def get_graph_image(image_id: str):
-    """
-    Stream graph image by ID (production-grade endpoint)
-    
-    Benefits:
-    - Smaller JSON payloads (no base64 embedding)
-    - Browser caching support
-    - CDN compatible
-    - Bandwidth efficient
-    
-    Usage:
-        GET /api/v1/forecast/graph/data_visualization_20260127_120000
-    """
-    try:
-        # Security: Validate image_id to prevent directory traversal
-        if ".." in image_id or "/" in image_id:
-            raise HTTPException(status_code=400, detail="Invalid image ID")
         
-        # Construct filepath
-        from tools import PLOTS_DIR
-        filepath = PLOTS_DIR / f"{image_id}.png"
-        
-        # Check if file exists
-        if not filepath.exists():
-            logger.warning(f"[API] Graph not found: {filepath}")
-            raise HTTPException(status_code=404, detail="Graph image not found")
-        
-        logger.info(f"[API] Serving graph: {image_id}")
-        
-        # Stream the file
-        return FileResponse(
-            filepath,
-            media_type="image/png",
-            headers={
-                "Cache-Control": "public, max-age=86400",  # Cache for 1 day
-                "Content-Disposition": f"inline; filename={image_id}.png"
-            }
-        )
-    
-    except HTTPException as e:
-        raise e
-    except Exception as e:
-        logger.error(f"[API] Error retrieving graph: {str(e)}")
-        raise HTTPException(status_code=500, detail="Error retrieving graph")
-
-
-@router.get("/graph/{image_id}/base64")
-async def get_graph_image_base64(image_id: str):
-    """
-    Optional: Get graph as base64 (for clients that need it)
-    Use sparingly - better to use /graph/{image_id} endpoint
-    """
-    try:
-        if ".." in image_id or "/" in image_id:
-            raise HTTPException(status_code=400, detail="Invalid image ID")
-        
-        from tools import PLOTS_DIR
-        filepath = PLOTS_DIR / f"{image_id}.png"
-        
-        if not filepath.exists():
-            raise HTTPException(status_code=404, detail="Graph image not found")
-        
-        with open(filepath, "rb") as f:
-            image_base64 = base64.b64encode(f.read()).decode('utf-8')
-        
-        return {
-            "image_id": image_id,
-            "image_base64": image_base64,
-            "media_type": "image/png"
-        }
-    
-    except HTTPException as e:
-        raise e
-    except Exception as e:
-        logger.error(f"[API] Error encoding graph: {str(e)}")
-        raise HTTPException(status_code=500, detail="Error encoding graph")
-
-
-
 async def health_check():
     """Health check endpoint"""
     db_type = os.getenv("DB_TYPE", "sqlite")
